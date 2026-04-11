@@ -119,5 +119,4 @@ PRESS_REGISTRY = {
     "decoding_keydiff": DecodingPress(base_press=KeyDiffPress()),
     "merging_snapkv": MergingPress(SnapKVPress()),
     "merging_knorm": MergingPress(KnormPress()),
-    "adakv_merging_snapkv": AdaKVPress(MergingPress(SnapKVPress())),
 }

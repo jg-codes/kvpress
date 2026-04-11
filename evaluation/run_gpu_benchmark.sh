@@ -35,11 +35,12 @@ done
 PRESSES=(
   "no_press"
   "snapkv"
+  "knorm"
   "adakv_snapkv"
   "critical_adakv_snapkv"
   # Our contribution
   "merging_snapkv"
-  "adakv_merging_snapkv"
+  "merging_knorm"
 )
 
 COMPRESSION_RATIOS=(0.25 0.5 0.75)

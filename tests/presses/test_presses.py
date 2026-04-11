@@ -20,6 +20,7 @@ from kvpress import (
     KnormPress,
     KVComposePress,
     KVzipPress,
+    MergingPress,
     ObservedAttentionPress,
     ScorerPress,
     SnapKVPress,
@@ -72,6 +73,7 @@ def test_chunkkv_press(unit_test_model):  # noqa: F811
         CriticalKVPress,
         CriticalAdaKVPress,
         DMSPress,
+        MergingPress,
     ],
 )
 def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
@@ -94,6 +96,8 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
                 press = ChunkPress(press=press, chunk_length=24)
             elif issubclass(wrapper_press, DMSPress):
                 press = DMSPress(press=press, threshold=-0.5, sliding_window_size=32)
+            elif issubclass(wrapper_press, MergingPress):
+                press = MergingPress(press=press)
 
         # TODO: Handle post_init_from_model differently
         if hasattr(press, "post_init_from_model"):

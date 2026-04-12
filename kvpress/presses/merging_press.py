@@ -92,8 +92,8 @@ class MergingPress(BasePress):
 
         # --- 3. Gather kept and evicted tensors ---
         idx4_keep = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        kept_keys = keys.gather(2, idx4_keep)      # (bsz, H, n_kept, D)
-        kept_values = values.gather(2, idx4_keep)   # (bsz, H, n_kept, D)
+        kept_keys = keys.gather(2, idx4_keep)  # (bsz, H, n_kept, D)
+        kept_values = values.gather(2, idx4_keep)  # (bsz, H, n_kept, D)
 
         # --- 4. Vectorised merge-on-evict ---
         # For each (batch, head) slice: compute cosine similarity between evicted and kept keys,
@@ -106,13 +106,11 @@ class MergingPress(BasePress):
                 if e_pos.shape[0] == 0:
                     continue
 
-                e_keys = keys[b, h, e_pos]       # (n_evict, D)
-                s_keys = kept_keys[b, h]          # (n_kept, D)
+                e_keys = keys[b, h, e_pos]  # (n_evict, D)
+                s_keys = kept_keys[b, h]  # (n_kept, D)
 
                 # Cosine similarity: (n_evict, n_kept)
-                sim = F.cosine_similarity(
-                    e_keys.unsqueeze(1), s_keys.unsqueeze(0), dim=-1
-                )
+                sim = F.cosine_similarity(e_keys.unsqueeze(1), s_keys.unsqueeze(0), dim=-1)
                 max_sim, target_idx = sim.max(dim=1)  # (n_evict,)
 
                 # Gate by similarity threshold
@@ -134,9 +132,13 @@ class MergingPress(BasePress):
                 weighted_e_vals = e_weights.unsqueeze(-1) * e_vals_m
 
                 key_accum = torch.zeros_like(kept_keys[b, h])
-                key_accum.scatter_add_(0, tgt.unsqueeze(-1).expand_as(weighted_e_keys), weighted_e_keys.to(key_accum.dtype))
+                key_accum.scatter_add_(
+                    0, tgt.unsqueeze(-1).expand_as(weighted_e_keys), weighted_e_keys.to(key_accum.dtype)
+                )
                 val_accum = torch.zeros_like(kept_values[b, h])
-                val_accum.scatter_add_(0, tgt.unsqueeze(-1).expand_as(weighted_e_vals), weighted_e_vals.to(val_accum.dtype))
+                val_accum.scatter_add_(
+                    0, tgt.unsqueeze(-1).expand_as(weighted_e_vals), weighted_e_vals.to(val_accum.dtype)
+                )
 
                 weight_accum = torch.zeros(n_kept, device=keys.device, dtype=scores.dtype)
                 weight_accum.scatter_add_(0, tgt, e_weights)

@@ -19,9 +19,8 @@ class MergingPress(BasePress):
 
     Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
     each evicted token is folded into its most similar surviving neighbor rather than
-    being discarded.  Both keys and values are blended via a similarity-weighted
-    average: each evicted token's contribution is proportional to its cosine similarity
-    with the target survivor, while kept tokens anchor at unit weight.
+    being discarded.  Values are blended via a similarity-weighted average; keys can
+    optionally be merged or left unchanged depending on the ``merge_keys`` flag.
 
     The scoring is delegated entirely to the wrapped press; only the eviction step
     changes.  This makes the wrapper composable with all existing scorers.
@@ -36,10 +35,22 @@ class MergingPress(BasePress):
         without merging.  Because cosine similarity can be negative, ``threshold=0.0``
         still drops tokens whose keys point in the opposite direction of all survivors.
         Use 0.0 to merge same-direction tokens; 0.8 for conservative gating.
+    merge_keys : bool, default=True
+        Whether to merge evicted information into kept keys.  When ``False``, only
+        values are merged — kept keys are returned unchanged.  This preserves RoPE
+        positional encoding in the keys and can improve quality on models that use
+        rotary embeddings.
+    value_norm_weighting : bool, default=False
+        When ``True``, the merge weight for each evicted token is additionally scaled
+        by the relative L2 norm of its value vector.  This allocates more merge budget
+        to evicted tokens that carry high-magnitude value content and less to those
+        with near-zero values.
     """
 
     press: ScorerPress
     similarity_threshold: float = 0.0
+    merge_keys: bool = True
+    value_norm_weighting: bool = False
 
     def __post_init__(self):
         assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
@@ -111,18 +122,24 @@ class MergingPress(BasePress):
         # --- 6. Similarity-weighted scatter-add merge ---
         # Use cosine similarity as the blend factor: the closer an evicted token
         # is to its target survivor, the more it shifts the merged result.  Kept
-        # tokens anchor at unit weight.  This avoids the pathology where low
-        # |score| of evicted tokens (the reason they were evicted) makes the
-        # merge a near-no-op at high compression ratios.
+        # tokens anchor at unit weight.
         evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
+
+        # Optional: scale merge weight by relative value norm so that
+        # high-magnitude evicted values contribute proportionally more.
+        if self.value_norm_weighting:
+            ev_vnorm = evict_values.float().norm(dim=-1)  # (B, H, n_evict)
+            # Gather kept-value norms at the target positions
+            kv_vnorm = kept_values.float().norm(dim=-1)  # (B, H, n_kept)
+            target_vnorm = kv_vnorm.gather(2, target_idx)  # (B, H, n_evict)
+            # Relative norm: evict / (evict + kept), clamped for stability
+            rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + 1e-8)
+            evict_w = evict_w * rel_norm
 
         ew = evict_w.unsqueeze(-1)  # (B, H, n_evict, 1)
         tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)  # (B, H, n_evict, D)
 
         # Accumulate in float32 for numerical stability
-        key_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
-        key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
-
         val_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
         val_accum.scatter_add_(2, tgt, ew * evict_values.float())
 
@@ -132,12 +149,20 @@ class MergingPress(BasePress):
         # --- 7. Normalize: weighted average for active positions ---
         active = w_accum > 0  # (B, H, n_kept)
         total_w = (1.0 + w_accum).unsqueeze(-1)  # (B, H, n_kept, 1), always >= 1
-
-        new_keys = (kept_keys.float() + key_accum) / total_w
-        new_vals = (kept_values.float() + val_accum) / total_w
-
         active_mask = active.unsqueeze(-1)  # (B, H, n_kept, 1)
-        merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+
+        # Values are always merged
+        new_vals = (kept_values.float() + val_accum) / total_w
         merged_values = torch.where(active_mask, new_vals.to(kept_values.dtype), kept_values)
+
+        # Keys are merged only when merge_keys=True; otherwise kept keys are
+        # returned unchanged, preserving their original RoPE encoding.
+        if self.merge_keys:
+            key_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+            key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
+            new_keys = (kept_keys.float() + key_accum) / total_w
+            merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+        else:
+            merged_keys = kept_keys
 
         return merged_keys.contiguous(), merged_values.contiguous()

@@ -122,5 +122,13 @@ PRESS_REGISTRY = {
     "merging_expected_attention": MergingPress(ExpectedAttentionPress()),
     "merging_critical_snapkv": MergingPress(CriticalKVPress(SnapKVPress())),
     "merging_critical_expected_attention": MergingPress(CriticalKVPress(ExpectedAttentionPress(use_vnorm=False))),
+    # Values-only merge variants (merge_keys=False): preserves RoPE key encoding
+    "merging_vo_snapkv": MergingPress(SnapKVPress(), merge_keys=False),
+    "merging_vo_expected_attention": MergingPress(ExpectedAttentionPress(), merge_keys=False),
+    # Values-only + value-norm weighting variants
+    "merging_vonorm_snapkv": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
+    "merging_vonorm_expected_attention": MergingPress(
+        ExpectedAttentionPress(), merge_keys=False, value_norm_weighting=True
+    ),
     "expected_attention_plain": ExpectedAttentionPress(),
 }

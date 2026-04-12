@@ -13,6 +13,7 @@ from transformers.cache_utils import QuantizedCache
 
 from kvpress.presses.adakv_press import AdaKVPress
 from kvpress.presses.base_press import BasePress
+from kvpress.presses.merging_press import MergingPress
 from kvpress.presses.scorer_press import ScorerPress
 from kvpress.utils import extract_keys_and_values
 
@@ -25,13 +26,13 @@ class DecodingPress(BasePress):
     A press that only operates during decoding phase and maintains a running buffer of hidden states.
 
     This press accumulates hidden states during decoding and applies compression every N steps
-    using a scorer press to determine which tokens to keep.
+    using a base press to determine which tokens to keep.
 
 
     Parameters
     ----------
-    base_press : ScorerPress
-        The scorer press used to compute importance scores for tokens.
+    base_press : ScorerPress | AdaKVPress | MergingPress
+        The press used to compress the KV cache.
     compression_interval : int, default=512
         Number of decoding steps between compression, i.e. compression will be applied every compression_interval steps.
     target_size : int, default=2048
@@ -42,14 +43,16 @@ class DecodingPress(BasePress):
         current hidden state for compression scoring.
     """
 
-    base_press: ScorerPress | AdaKVPress
+    base_press: ScorerPress | AdaKVPress | MergingPress
     compression_interval: int = 512
     target_size: int = 2048
     hidden_states_buffer_size: int = 256
 
     def __post_init__(self):
         # Buffer to store hidden states during decoding (per layer)
-        assert isinstance(self.base_press, (ScorerPress, AdaKVPress)), "DecodingPress requires a ScorerPress as input"
+        assert isinstance(self.base_press, (ScorerPress, AdaKVPress, MergingPress)), (
+            "DecodingPress requires a ScorerPress, AdaKVPress, or MergingPress as input"
+        )
         self.hidden_states_buffer = defaultdict(list)  # Per-layer buffer
         self.layer_step_counts = defaultdict(int)  # Track step count per layer
 

@@ -130,14 +130,14 @@ class MergingPress(BasePress):
                 s_scores = scores[b, h].gather(0, keep_idx[b, h].gather(0, tgt)).abs()
                 alpha = e_scores / (e_scores + s_scores + 1e-8)  # (n_merge,)
 
-                # Key merge: score-weighted average
+                # Key merge: score-weighted interpolation
                 # k_survivor += alpha * (k_evicted - k_survivor)
                 delta_k = alpha.unsqueeze(-1) * (e_keys_m - kept_keys[b, h, tgt])
                 kept_keys[b, h].scatter_add_(0, tgt.unsqueeze(-1).expand_as(delta_k), delta_k.to(kept_keys.dtype))
 
-                # Value merge: cosine-similarity-weighted addition
-                # v_survivor += cos_sim * v_evicted
-                delta_v = cosines.unsqueeze(-1) * e_vals_m
+                # Value merge: score-weighted interpolation (same as keys to preserve magnitude)
+                # v_survivor += alpha * (v_evicted - v_survivor)
+                delta_v = alpha.unsqueeze(-1) * (e_vals_m - kept_values[b, h, tgt])
                 kept_values[b, h].scatter_add_(0, tgt.unsqueeze(-1).expand_as(delta_v), delta_v.to(kept_values.dtype))
 
         return kept_keys.contiguous(), kept_values.contiguous()

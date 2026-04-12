@@ -139,3 +139,22 @@ class TestMergingPress:
                 any_different = True
                 break
         assert any_different, "Merging did not modify keys"
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_half_precision_no_nan(self, unit_test_model, dtype):  # noqa: F811
+        """Merged keys/values must be finite in float16 and bfloat16."""
+        model = unit_test_model.to(dtype)
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(model):
+            cache = DynamicCache()
+            model(input_ids, past_key_values=cache)
+
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), f"Non-finite keys with {dtype}"
+            assert torch.isfinite(layer.values).all(), f"Non-finite values with {dtype}"
+            assert layer.keys.dtype == dtype
+        model.float()  # restore

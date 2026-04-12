@@ -19,9 +19,8 @@ class MergingPress(BasePress):
 
     Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
     each evicted token is folded into its most similar surviving neighbor rather than
-    being discarded.  Keys are blended via a score-weighted average; values are added
-    with a cosine-similarity weight that limits magnitude inflation while partially
-    compensating for attention sag.
+    being discarded.  Both keys and values are blended via a score-weighted average,
+    where the weight of each token is the absolute value of its scorer importance.
 
     The scoring is delegated entirely to the wrapped press; only the eviction step
     changes.  This makes the wrapper composable with all existing scorers.
@@ -33,7 +32,9 @@ class MergingPress(BasePress):
     similarity_threshold : float, default=0.0
         Minimum cosine similarity between an evicted key and its nearest survivor
         for the merge to proceed.  Evicted tokens below this threshold are dropped
-        without merging.  Use 0.0 to merge all; 0.8 for conservative gating.
+        without merging.  Because cosine similarity can be negative, ``threshold=0.0``
+        still drops tokens whose keys point in the opposite direction of all survivors.
+        Use 0.0 to merge same-direction tokens; 0.8 for conservative gating.
     """
 
     press: ScorerPress
@@ -70,87 +71,67 @@ class MergingPress(BasePress):
 
         # --- 1. Score via wrapped press ---
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
-        # scores: (bsz, num_kv_heads, k_len)
+        # scores: (B, H, k_len)
 
         n_kept = int(k_len * (1 - self.press.compression_ratio))
         if n_kept >= k_len:
             return keys, values
+        n_evict = k_len - n_kept
 
         # --- 2. Partition into keep / evict ---
-        topk = scores.topk(n_kept, dim=-1)
-        keep_idx = topk.indices  # (bsz, num_kv_heads, n_kept)
+        keep_idx = scores.topk(n_kept, dim=-1).indices  # (B, H, n_kept)
 
-        # Build evict mask and indices
+        # Evict mask → evict indices (uniform n_evict per slice)
         mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
         mask.scatter_(2, keep_idx, False)
-        evict_idx = mask.nonzero(as_tuple=False)  # (N_evict, 3) — [batch, head, pos]
-
-        if evict_idx.shape[0] == 0:
-            # Nothing to evict
-            idx4 = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            return keys.gather(2, idx4).contiguous(), values.gather(2, idx4).contiguous()
+        evict_idx = mask.nonzero(as_tuple=False)[:, 2].reshape(bsz, num_kv_heads, n_evict)
 
         # --- 3. Gather kept and evicted tensors ---
-        idx4_keep = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        kept_keys = keys.gather(2, idx4_keep)  # (bsz, H, n_kept, D)
-        kept_values = values.gather(2, idx4_keep)  # (bsz, H, n_kept, D)
+        idx4 = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        kept_keys = keys.gather(2, idx4)  # (B, H, n_kept, D)
+        kept_values = values.gather(2, idx4)
 
-        # --- 4. Vectorised merge-on-evict ---
-        # For each (batch, head) slice: compute cosine similarity between evicted and kept keys,
-        # find the nearest survivor, and merge if above threshold.
-        for b in range(bsz):
-            for h in range(num_kv_heads):
-                # Indices of evicted positions within this (b, h) slice
-                slice_mask = (evict_idx[:, 0] == b) & (evict_idx[:, 1] == h)
-                e_pos = evict_idx[slice_mask, 2]  # positions in original seq
-                if e_pos.shape[0] == 0:
-                    continue
+        idx4_e = evict_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        evict_keys = keys.gather(2, idx4_e)  # (B, H, n_evict, D)
+        evict_values = values.gather(2, idx4_e)
 
-                e_keys = keys[b, h, e_pos]  # (n_evict, D)
-                s_keys = kept_keys[b, h]  # (n_kept, D)
+        # --- 4. Batched cosine similarity → nearest survivor ---
+        e_norm = F.normalize(evict_keys.float(), dim=-1)
+        s_norm = F.normalize(kept_keys.float(), dim=-1)
+        # (B, H, n_evict, n_kept)
+        sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))
+        max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
-                # Cosine similarity: (n_evict, n_kept)
-                sim = F.cosine_similarity(e_keys.unsqueeze(1), s_keys.unsqueeze(0), dim=-1)
-                max_sim, target_idx = sim.max(dim=1)  # (n_evict,)
+        # --- 5. Threshold gate ---
+        merge_mask = max_sim >= self.similarity_threshold  # (B, H, n_evict)
+        if not merge_mask.any():
+            return kept_keys.contiguous(), kept_values.contiguous()
 
-                # Gate by similarity threshold
-                merge_mask = max_sim >= self.similarity_threshold
-                if not merge_mask.any():
-                    continue
+        # --- 6. Score-weighted scatter-add merge ---
+        evict_w = scores.gather(2, evict_idx).abs() * merge_mask  # (B, H, n_evict)
+        kept_w = scores.gather(2, keep_idx).abs()  # (B, H, n_kept)
 
-                e_keys_m = e_keys[merge_mask]
-                e_vals_m = values[b, h, e_pos[merge_mask]]
-                tgt = target_idx[merge_mask]
+        ew = evict_w.unsqueeze(-1)  # (B, H, n_evict, 1)
+        tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)  # (B, H, n_evict, D)
 
-                # Use absolute scores as merge weights
-                e_weights = scores[b, h, e_pos[merge_mask]].abs()
-                all_s_weights = scores[b, h].gather(0, keep_idx[b, h]).abs()
+        key_accum = torch.zeros_like(kept_keys)
+        key_accum.scatter_add_(2, tgt, (ew * evict_keys).to(key_accum.dtype))
 
-                # Proper weighted average: for each survivor j receiving evicted tokens,
-                #   new_j = (w_j * j + sum_i(w_i * e_i)) / (w_j + sum_i(w_i))
-                weighted_e_keys = e_weights.unsqueeze(-1) * e_keys_m
-                weighted_e_vals = e_weights.unsqueeze(-1) * e_vals_m
+        val_accum = torch.zeros_like(kept_values)
+        val_accum.scatter_add_(2, tgt, (ew * evict_values).to(val_accum.dtype))
 
-                key_accum = torch.zeros_like(kept_keys[b, h])
-                key_accum.scatter_add_(
-                    0, tgt.unsqueeze(-1).expand_as(weighted_e_keys), weighted_e_keys.to(key_accum.dtype)
-                )
-                val_accum = torch.zeros_like(kept_values[b, h])
-                val_accum.scatter_add_(
-                    0, tgt.unsqueeze(-1).expand_as(weighted_e_vals), weighted_e_vals.to(val_accum.dtype)
-                )
+        w_accum = torch.zeros_like(kept_w)  # (B, H, n_kept)
+        w_accum.scatter_add_(2, target_idx, evict_w)
 
-                weight_accum = torch.zeros(n_kept, device=keys.device, dtype=scores.dtype)
-                weight_accum.scatter_add_(0, tgt, e_weights)
+        # --- 7. Normalize: weighted average for active positions ---
+        active = w_accum > 0  # (B, H, n_kept)
+        total_w = (kept_w + w_accum).unsqueeze(-1).clamp(min=1e-10)  # (B, H, n_kept, 1)
 
-                active = weight_accum > 0
-                if active.any():
-                    total_w = (all_s_weights[active] + weight_accum[active]).unsqueeze(-1)
-                    kept_keys[b, h, active] = (
-                        all_s_weights[active].unsqueeze(-1) * kept_keys[b, h, active] + key_accum[active]
-                    ).to(kept_keys.dtype) / total_w.to(kept_keys.dtype)
-                    kept_values[b, h, active] = (
-                        all_s_weights[active].unsqueeze(-1) * kept_values[b, h, active] + val_accum[active]
-                    ).to(kept_values.dtype) / total_w.to(kept_values.dtype)
+        new_keys = (kept_w.unsqueeze(-1) * kept_keys + key_accum) / total_w.to(kept_keys.dtype)
+        new_vals = (kept_w.unsqueeze(-1) * kept_values + val_accum) / total_w.to(kept_values.dtype)
 
-        return kept_keys.contiguous(), kept_values.contiguous()
+        active_mask = active.unsqueeze(-1)  # (B, H, n_kept, 1)
+        merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+        merged_values = torch.where(active_mask, new_vals.to(kept_values.dtype), kept_values)
+
+        return merged_keys.contiguous(), merged_values.contiguous()

@@ -130,5 +130,8 @@ PRESS_REGISTRY = {
     "merging_vonorm_expected_attention": MergingPress(
         ExpectedAttentionPress(), merge_keys=False, value_norm_weighting=True
     ),
+    "merging_vonorm_critical_snapkv": MergingPress(
+        CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True
+    ),
     "expected_attention_plain": ExpectedAttentionPress(),
 }

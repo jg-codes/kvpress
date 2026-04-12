@@ -38,3 +38,13 @@ for press in "${press_names[@]}"; do
     python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press --compression_ratio 0.875 --output_dir $output_dir --device "cuda:3" --query_aware &
     wait
 done
+
+# Loop 3: MergingPress compositions (scorer-agnostic merge-on-evict wrapper)
+press_names=("merging_snapkv" "merging_knorm" "merging_critical_snapkv" "merging_critical_expected_attention")
+for press in "${press_names[@]}"; do  
+    python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press --compression_ratio 0.25  --output_dir $output_dir --device "cuda:0" &
+    python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press --compression_ratio 0.50  --output_dir $output_dir --device "cuda:1" &
+    python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press --compression_ratio 0.75  --output_dir $output_dir --device "cuda:2" &
+    python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press --compression_ratio 0.875 --output_dir $output_dir --device "cuda:3" &
+    wait
+done

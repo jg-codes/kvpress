@@ -19,8 +19,9 @@ class MergingPress(BasePress):
 
     Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
     each evicted token is folded into its most similar surviving neighbor rather than
-    being discarded.  Both keys and values are blended via a score-weighted average,
-    where the weight of each token is the absolute value of its scorer importance.
+    being discarded.  Both keys and values are blended via a similarity-weighted
+    average: each evicted token's contribution is proportional to its cosine similarity
+    with the target survivor, while kept tokens anchor at unit weight.
 
     The scoring is delegated entirely to the wrapped press; only the eviction step
     changes.  This makes the wrapper composable with all existing scorers.
@@ -107,28 +108,33 @@ class MergingPress(BasePress):
         if not merge_mask.any():
             return kept_keys.contiguous(), kept_values.contiguous()
 
-        # --- 6. Score-weighted scatter-add merge ---
-        evict_w = scores.gather(2, evict_idx).abs() * merge_mask  # (B, H, n_evict)
-        kept_w = scores.gather(2, keep_idx).abs()  # (B, H, n_kept)
+        # --- 6. Similarity-weighted scatter-add merge ---
+        # Use cosine similarity as the blend factor: the closer an evicted token
+        # is to its target survivor, the more it shifts the merged result.  Kept
+        # tokens anchor at unit weight.  This avoids the pathology where low
+        # |score| of evicted tokens (the reason they were evicted) makes the
+        # merge a near-no-op at high compression ratios.
+        evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
 
         ew = evict_w.unsqueeze(-1)  # (B, H, n_evict, 1)
         tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)  # (B, H, n_evict, D)
 
-        key_accum = torch.zeros_like(kept_keys)
-        key_accum.scatter_add_(2, tgt, (ew * evict_keys).to(key_accum.dtype))
+        # Accumulate in float32 for numerical stability
+        key_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+        key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
 
-        val_accum = torch.zeros_like(kept_values)
-        val_accum.scatter_add_(2, tgt, (ew * evict_values).to(val_accum.dtype))
+        val_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+        val_accum.scatter_add_(2, tgt, ew * evict_values.float())
 
-        w_accum = torch.zeros_like(kept_w)  # (B, H, n_kept)
+        w_accum = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device, dtype=torch.float32)
         w_accum.scatter_add_(2, target_idx, evict_w)
 
         # --- 7. Normalize: weighted average for active positions ---
         active = w_accum > 0  # (B, H, n_kept)
-        total_w = (kept_w + w_accum).unsqueeze(-1).clamp(min=1e-10)  # (B, H, n_kept, 1)
+        total_w = (1.0 + w_accum).unsqueeze(-1)  # (B, H, n_kept, 1), always >= 1
 
-        new_keys = (kept_w.unsqueeze(-1) * kept_keys + key_accum) / total_w.to(kept_keys.dtype)
-        new_vals = (kept_w.unsqueeze(-1) * kept_values + val_accum) / total_w.to(kept_values.dtype)
+        new_keys = (kept_keys.float() + key_accum) / total_w
+        new_vals = (kept_values.float() + val_accum) / total_w
 
         active_mask = active.unsqueeze(-1)  # (B, H, n_kept, 1)
         merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)

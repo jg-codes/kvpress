@@ -123,21 +123,32 @@ class MergingPress(BasePress):
                 e_keys_m = e_keys[merge_mask]
                 e_vals_m = values[b, h, e_pos[merge_mask]]
                 tgt = target_idx[merge_mask]
-                cosines = max_sim[merge_mask]
 
-                # Scores for blending weight
-                e_scores = scores[b, h, e_pos[merge_mask]].abs()
-                s_scores = scores[b, h].gather(0, keep_idx[b, h].gather(0, tgt)).abs()
-                alpha = e_scores / (e_scores + s_scores + 1e-8)  # (n_merge,)
+                # Use absolute scores as merge weights
+                e_weights = scores[b, h, e_pos[merge_mask]].abs()
+                all_s_weights = scores[b, h].gather(0, keep_idx[b, h]).abs()
 
-                # Key merge: score-weighted interpolation
-                # k_survivor += alpha * (k_evicted - k_survivor)
-                delta_k = alpha.unsqueeze(-1) * (e_keys_m - kept_keys[b, h, tgt])
-                kept_keys[b, h].scatter_add_(0, tgt.unsqueeze(-1).expand_as(delta_k), delta_k.to(kept_keys.dtype))
+                # Proper weighted average: for each survivor j receiving evicted tokens,
+                #   new_j = (w_j * j + sum_i(w_i * e_i)) / (w_j + sum_i(w_i))
+                weighted_e_keys = e_weights.unsqueeze(-1) * e_keys_m
+                weighted_e_vals = e_weights.unsqueeze(-1) * e_vals_m
 
-                # Value merge: score-weighted interpolation (same as keys to preserve magnitude)
-                # v_survivor += alpha * (v_evicted - v_survivor)
-                delta_v = alpha.unsqueeze(-1) * (e_vals_m - kept_values[b, h, tgt])
-                kept_values[b, h].scatter_add_(0, tgt.unsqueeze(-1).expand_as(delta_v), delta_v.to(kept_values.dtype))
+                key_accum = torch.zeros_like(kept_keys[b, h])
+                key_accum.scatter_add_(0, tgt.unsqueeze(-1).expand_as(weighted_e_keys), weighted_e_keys.to(key_accum.dtype))
+                val_accum = torch.zeros_like(kept_values[b, h])
+                val_accum.scatter_add_(0, tgt.unsqueeze(-1).expand_as(weighted_e_vals), weighted_e_vals.to(val_accum.dtype))
+
+                weight_accum = torch.zeros(n_kept, device=keys.device, dtype=scores.dtype)
+                weight_accum.scatter_add_(0, tgt, e_weights)
+
+                active = weight_accum > 0
+                if active.any():
+                    total_w = (all_s_weights[active] + weight_accum[active]).unsqueeze(-1)
+                    kept_keys[b, h, active] = (
+                        all_s_weights[active].unsqueeze(-1) * kept_keys[b, h, active] + key_accum[active]
+                    ).to(kept_keys.dtype) / total_w.to(kept_keys.dtype)
+                    kept_values[b, h, active] = (
+                        all_s_weights[active].unsqueeze(-1) * kept_values[b, h, active] + val_accum[active]
+                    ).to(kept_values.dtype) / total_w.to(kept_values.dtype)
 
         return kept_keys.contiguous(), kept_values.contiguous()

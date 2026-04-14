@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Create a GCloud spot VM with L4 GPU for MergingPress benchmark.
-# L4 = 24GB VRAM, enough for Qwen2.5-7B-Instruct in bf16 (~14GB).
+# L4 = 24GB VRAM, enough for Qwen3-8B in bf16 (~16GB).
 #
 # COST: ~$0.22/hr (spot) for g2-standard-8 + 1xL4
-# ESTIMATED RUNTIME: ~2-4hr for RULER-4096 full sweep
+# ESTIMATED RUNTIME: ~22hr for 4 variants × RULER-4096 full (6500 samples each)
+#                    ~2hr for 4 variants × RULER-4096 @ fraction=0.1
 #
 # Usage:
 #   bash gcloud_create_vm.sh          # create VM

@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # GPU benchmark for MergingPress paper results.
-# Run on a single A100/L4 GPU via GCloud or Modal.
+# Run on a single L4 GPU via GCloud Spot.
+#
+# evaluate.py has skip-if-exists logic: if predictions.csv + metrics.json
+# already exist for a (press, cr, model, dataset) combo, the run is skipped.
+# This makes the script safe to re-run after spot preemption.
 #
 # Usage:
 #   cd evaluation
 #   bash run_gpu_benchmark.sh [--model MODEL] [--dataset DATASET] [--data-dir DATADIR] [--fraction FRAC]
 #
-# Defaults to Qwen2.5-7B-Instruct on RULER-4096. Override as needed.
+# Defaults to Qwen/Qwen3-8B on RULER-4096 (matches official leaderboard.sh).
 # Results are saved to ./results/<model>/<dataset>/<press>/<cr>/
 
 set -euo pipefail
 
 # ── Defaults (override via CLI flags) ──
-MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-ruler}"
 DATA_DIR="${DATA_DIR:-4096}"
 FRACTION="${FRACTION:-1.0}"
@@ -33,17 +37,14 @@ done
 # ── Presses to evaluate ──
 # Baselines
 PRESSES=(
-  "no_press"
   "snapkv"
-  "knorm"
-  "adakv_snapkv"
-  "critical_adakv_snapkv"
-  # Our contribution
-  "merging_snapkv"
-  "merging_knorm"
+  "critical_snapkv"
+  # Our MergingPress contribution (merge_keys=False, value_norm_weighting=True)
+  "merging_vonorm_snapkv"
+  "merging_vonorm_critical_snapkv"
 )
 
-COMPRESSION_RATIOS=(0.25 0.5 0.75)
+COMPRESSION_RATIOS=(0.75)
 
 echo "========================================="
 echo "  GPU Benchmark: MergingPress evaluation"

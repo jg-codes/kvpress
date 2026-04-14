@@ -149,6 +149,23 @@ PRESS_REGISTRY = {
     "merging_vonorm_critical_snapkv": MergingPress(
         CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True
     ),
+    # Score-weighted merge variants (evicted token importance modulates merge contribution)
+    "merging_score_knorm": MergingPress(
+        KnormPress(), merge_keys=False, value_norm_weighting=True, score_weighting=True
+    ),
+    "merging_score_snapkv": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, score_weighting=True
+    ),
+    "merging_score_critical_snapkv": MergingPress(
+        CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True, score_weighting=True
+    ),
+    # Ablation: similarity-only (no value norm weighting, no score weighting)
+    "merging_simonly_knorm": MergingPress(
+        KnormPress(), merge_keys=False, value_norm_weighting=False, score_weighting=False
+    ),
+    "merging_simonly_snapkv": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=False, score_weighting=False
+    ),
     # MergingDecodingPress: merge-on-evict during decoding
     "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
     "merging_decoding_snapkv": MergingDecodingPress(base_press=SnapKVPress()),

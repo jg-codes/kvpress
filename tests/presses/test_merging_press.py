@@ -441,4 +441,27 @@ class TestMergingPress:
         for layer in cache.layers:
             assert torch.isfinite(layer.keys).all(), "Non-finite keys with QuantizedCache"
             assert torch.isfinite(layer.values).all(), "Non-finite values with QuantizedCache"
+
+    def test_score_weighting_changes_output(self, unit_test_model):  # noqa: F811
+        """score_weighting=True should produce different merge results."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_plain = MergingPress(press=base1, score_weighting=False)
+        with wrap_plain(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_score = MergingPress(press=base2, score_weighting=True)
+        with wrap_score(unit_test_model):
+            cache_score = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_score)
+
+        any_different = any(
+            not torch.equal(cache_plain.layers[i].values, cache_score.layers[i].values)
+            for i in range(len(cache_plain.layers))
+        )
+        assert any_different, "score_weighting did not change merge results"
 # SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

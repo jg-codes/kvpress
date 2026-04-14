@@ -26,6 +26,7 @@ def _merge_on_evict(
     value_norm_weighting: bool,
     max_merge_per_token: int = 0,
     collect_diagnostics: bool = False,
+    score_weighting: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Core merge-on-evict kernel shared by :class:`MergingPress` (prefill) and
@@ -67,6 +68,11 @@ def _merge_on_evict(
         merge weight is scaled down proportionally so the total deposited
         weight does not exceed ``max_merge_per_token × mean_weight``.
         ``0`` disables the cap (default).
+    score_weighting : bool, default=False
+        When ``True``, the merge weight for each evicted token is additionally
+        scaled by its normalised importance score (relative to the evict set).
+        Tokens that barely missed the keep threshold contribute more to their
+        target survivor than truly unimportant tokens.
 
     Returns
     -------
@@ -123,6 +129,15 @@ def _merge_on_evict(
 
     # --- Similarity-weighted scatter-add merge ---
     evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
+
+    if score_weighting:
+        evict_scores = scores.gather(2, evict_idx).float()  # (B, H, n_evict)
+        # Normalise within evict set to [0, 1] so scale is independent of scorer
+        s_min = evict_scores.min(dim=-1, keepdim=True).values
+        s_max = evict_scores.max(dim=-1, keepdim=True).values
+        s_range = (s_max - s_min).clamp(min=1e-8)
+        norm_scores = (evict_scores - s_min) / s_range  # 0 = least important, 1 = just missed keep
+        evict_w = evict_w * (0.5 + 0.5 * norm_scores)  # floor at 0.5 to avoid zeroing out
 
     if value_norm_weighting:
         ev_vnorm = evict_values.float().norm(dim=-1)
@@ -229,6 +244,7 @@ class MergingPress(BasePress):
     merge_keys: bool = False
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
+    score_weighting: bool = False
     collect_diagnostics: bool = False
     diagnostics: list = field(default_factory=list, repr=False)
 
@@ -271,7 +287,7 @@ class MergingPress(BasePress):
 
         result = _merge_on_evict(
             keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token, self.collect_diagnostics,
+            self.max_merge_per_token, self.collect_diagnostics, self.score_weighting,
         )
         if self.collect_diagnostics and len(result) == 3:
             merged_keys, merged_values, diag = result
@@ -324,6 +340,7 @@ class MergingDecodingPress(DecodingPress):
     merge_keys: bool = False
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
+    score_weighting: bool = False
 
     def compress(
         self,
@@ -350,5 +367,5 @@ class MergingDecodingPress(DecodingPress):
 
         return _merge_on_evict(
             keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token,
+            self.max_merge_per_token, score_weighting=self.score_weighting,
         )

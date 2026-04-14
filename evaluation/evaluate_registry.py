@@ -136,6 +136,16 @@ PRESS_REGISTRY = {
     "merging_vonorm_snapkv_t07": MergingPress(
         SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.7
     ),
+    # max_merge_per_token sweep variants (snapkv scorer, vonorm config)
+    "merging_vonorm_snapkv_m1": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=1
+    ),
+    "merging_vonorm_snapkv_m3": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=3
+    ),
+    "merging_vonorm_snapkv_m5": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=5
+    ),
     "merging_vonorm_critical_snapkv": MergingPress(
         CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True
     ),

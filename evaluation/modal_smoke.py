@@ -23,8 +23,11 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
     .pip_install("packaging", "setuptools", "wheel")
+    # Pin torch to cu124 wheels — avoids CUDA driver mismatch on Modal fleet
+    .run_commands(
+        "pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124",
+    )
     .pip_install(
-        "torch>=2.3",
         "transformers>=4.48",
         "datasets",
         "pandas",
@@ -33,7 +36,6 @@ image = (
         "pyyaml",
         "tqdm",
         "accelerate",
-        gpu="L4",
     )
     .pip_install("kvpress @ git+https://github.com/jg-codes/kvpress.git@merging-press")
     .pip_install("jieba", "bert_score", "fuzzywuzzy", "python-Levenshtein", "nltk", "rouge")
@@ -62,23 +64,35 @@ PREFILL_VARIANTS = [
     "merging_vonorm_critical_snapkv",
 ]
 
+# Hyperparameter sweep variants (similarity_threshold + max_merge_per_token)
+SWEEP_VARIANTS = [
+    "snapkv",                        # baseline (already in PREFILL but needed for comparison)
+    "merging_vonorm_snapkv",         # threshold=0.0, max_merge=0 (default)
+    "merging_vonorm_snapkv_t03",     # threshold=0.3
+    "merging_vonorm_snapkv_t05",     # threshold=0.5
+    "merging_vonorm_snapkv_t07",     # threshold=0.7
+    "merging_vonorm_snapkv_m1",      # max_merge_per_token=1
+    "merging_vonorm_snapkv_m3",      # max_merge_per_token=3
+    "merging_vonorm_snapkv_m5",      # max_merge_per_token=5
+]
+
 CRS = [0.25, 0.50, 0.75, 0.875]
 
 
-def build_jobs(fraction: float) -> list[tuple[str, float, float]]:
+def build_jobs(fraction: float, sweep: bool = False) -> list[tuple[str, float, float]]:
     """Build (press_name, cr, fraction) tuples for all runs."""
+    variants = SWEEP_VARIANTS if sweep else PREFILL_VARIANTS
     jobs = []
     # no_press baseline (cr is ignored)
     jobs.append(("no_press", 0.75, fraction))
-    # Prefill matrix
-    for variant in PREFILL_VARIANTS:
+    for variant in variants:
         for cr in CRS:
             jobs.append((variant, cr, fraction))
     return jobs
 
 
 @app.function(
-    gpu="L4",
+    gpu="A100",
     timeout=3600,
     memory=32768,
     scaledown_window=2,
@@ -138,16 +152,79 @@ def compute_ci(scores: list[float], n: int = 1000, seed: int = 42) -> tuple[floa
     return mean, boot[int(0.025 * n)], boot[int(0.975 * n)]
 
 
-@app.local_entrypoint()
-def main(fraction: float = 0.001):
-    """Launch all (variant × CR) jobs in parallel, collect and display."""
-    jobs = build_jobs(fraction)
+def paired_bootstrap_ci(
+    base_tasks: dict[str, float], merge_tasks: dict[str, float],
+    n: int = 10000, seed: int = 42,
+) -> dict:
+    """Paired bootstrap 95% CI for delta (merging − baseline) over shared tasks.
 
-    print(f"\n{'='*90}")
-    print(f"Multi-CR Benchmark — Modal")
+    Returns dict with mean_delta, ci_lo, ci_hi, p_value (two-sided),
+    sign_test_p, and n_tasks.
+    """
+    import math
+    import random
+
+    shared = sorted(set(base_tasks) & set(merge_tasks))
+    deltas = [merge_tasks[t] - base_tasks[t] for t in shared]
+    k = len(deltas)
+    if k == 0:
+        return {"mean_delta": 0, "ci_lo": 0, "ci_hi": 0, "p_value": 1.0,
+                "sign_test_p": 1.0, "n_tasks": 0}
+
+    observed = sum(deltas) / k
+
+    random.seed(seed)
+    boot_means = sorted(
+        sum(random.choices(deltas, k=k)) / k for _ in range(n)
+    )
+    ci_lo = boot_means[int(0.025 * n)]
+    ci_hi = boot_means[int(0.975 * n)]
+
+    # Bootstrap p-value: fraction of resamples on wrong side of zero
+    if observed >= 0:
+        p = 2 * sum(1 for b in boot_means if b <= 0) / n
+    else:
+        p = 2 * sum(1 for b in boot_means if b >= 0) / n
+    p = min(p, 1.0)
+
+    # Sign test: under H0 (no effect), positive deltas ~ Binomial(k, 0.5)
+    pos = sum(1 for d in deltas if d > 0)
+    neg = sum(1 for d in deltas if d < 0)
+    n_nonzero = pos + neg
+    if n_nonzero > 0:
+        # Two-sided: P(X >= max(pos,neg)) under Binom(n_nonzero, 0.5)
+        from math import comb
+        tail_count = max(pos, neg)
+        sign_p = 2 * sum(comb(n_nonzero, i) for i in range(tail_count, n_nonzero + 1)) / (2 ** n_nonzero)
+        sign_p = min(sign_p, 1.0)
+    else:
+        sign_p = 1.0
+
+    return {
+        "mean_delta": round(observed, 2),
+        "ci_lo": round(ci_lo, 2),
+        "ci_hi": round(ci_hi, 2),
+        "p_value": round(p, 4),
+        "sign_test_p": round(sign_p, 4),
+        "n_tasks": k,
+        "positive": sum(1 for d in deltas if d > 0),
+        "negative": sum(1 for d in deltas if d < 0),
+        "tied": sum(1 for d in deltas if d == 0),
+    }
+
+
+@app.local_entrypoint()
+def main(fraction: float = 0.001, sweep: bool = False):
+    """Launch all (variant × CR) jobs in parallel, collect and display."""
+    jobs = build_jobs(fraction, sweep=sweep)
+    variants = SWEEP_VARIANTS if sweep else PREFILL_VARIANTS
+    mode = "SWEEP" if sweep else "Multi-CR"
+
+    print(f"\n{'='*100}")
+    print(f"{mode} Benchmark — Modal")
     print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR} | Fraction: {fraction} | Seed: {SEED}")
-    print(f"Jobs: {len(jobs)} ({len(PREFILL_VARIANTS)} variants × {len(CRS)} CRs + no_press)")
-    print(f"{'='*90}\n")
+    print(f"Jobs: {len(jobs)} ({len(variants)} variants × {len(CRS)} CRs + no_press)")
+    print(f"{'='*100}\n")
 
     results = list(run_one.starmap(jobs, return_exceptions=True))
 
@@ -197,17 +274,32 @@ def main(fraction: float = 0.001):
     print(f"{'='*90}")
 
     # --- Comparison table: baseline vs merging for each scorer ---
-    print(f"\n{'='*90}")
-    print("Scorer-Pair Comparison (merging delta over baseline)")
-    print(f"{'-'*90}")
-    print(f"{'Scorer':<15} {'CR':>5} {'Baseline':>10} {'+ Merging':>10} {'Delta':>8} {'Significant?':>13}")
-    print(f"{'-'*90}")
+    # Detect all merging wrapper pairs dynamically
+    pairs = []
+    seen_bases = set()
+    for label, r in table.items():
+        pn = r["press_name"]
+        if pn.startswith("merging_vonorm_"):
+            # Extract the base scorer name after the prefix
+            base = pn[len("merging_vonorm_"):]
+            if base not in seen_bases:
+                pairs.append((base, pn))
+                seen_bases.add(base)
+    # Fallback to known pairs if detection fails
+    if not pairs:
+        pairs = [
+            ("knorm", "merging_vonorm_knorm"),
+            ("snapkv", "merging_vonorm_snapkv"),
+            ("critical_snapkv", "merging_vonorm_critical_snapkv"),
+        ]
 
-    pairs = [
-        ("knorm", "merging_vonorm_knorm"),
-        ("snapkv", "merging_vonorm_snapkv"),
-        ("critical_snapkv", "merging_vonorm_critical_snapkv"),
-    ]
+    print(f"\n{'='*100}")
+    print("Paired Bootstrap Comparison (merging delta over baseline)")
+    print(f"{'-'*100}")
+    print(f"{'Scorer':<20} {'CR':>5} {'Base':>6} {'Merg':>6} {'Delta':>7} {'95% CI':>16} {'p_boot':>7} {'p_sign':>7} {'W/L/T':>7}")
+    print(f"{'-'*100}")
+
+    paired_results = []
     for base_name, merge_name in pairs:
         for cr in CRS:
             base_label = f"{base_name} (cr={cr:.2f})"
@@ -215,12 +307,17 @@ def main(fraction: float = 0.001):
             if base_label in table and merge_label in table:
                 b = table[base_label]
                 m = table[merge_label]
-                delta = m["mean"] - b["mean"]
-                # Non-overlapping CIs = likely significant
-                sig = "YES" if m["ci_lo"] > b["ci_hi"] or b["ci_lo"] > m["ci_hi"] else "no"
-                print(f"{base_name:<15} {cr:>5.2f} {b['mean']:>10.1f} {m['mean']:>10.1f} {delta:>+8.1f} {sig:>13}")
+                pr = paired_bootstrap_ci(b["per_task"], m["per_task"])
+                paired_results.append({"scorer": base_name, "cr": cr, **pr,
+                                        "base_mean": b["mean"], "merge_mean": m["mean"]})
+                ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
+                sig_mark = "*" if pr["p_value"] < 0.05 else " "
+                wlt = f"{pr['positive']}/{pr['negative']}/{pr['tied']}"
+                print(f"{base_name:<20} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+7.1f} {ci_str:>16} {pr['p_value']:>7.4f}{sig_mark}{pr['sign_test_p']:>7.4f} {wlt:>7}")
 
-    print(f"{'='*90}")
+    print(f"{'-'*100}")
+    print(f"  * = p < 0.05 (paired bootstrap, B=10000)")
+    print(f"{'='*100}")
 
     # Save JSON
     import pathlib
@@ -235,8 +332,10 @@ def main(fraction: float = 0.001):
             "crs": CRS,
         },
         "table": table,
+        "paired": paired_results,
         "errors": errors,
     }
-    out_path = pathlib.Path(f"evaluation/multi_cr_results_f{fraction}.json")
+    suffix = "_sweep" if sweep else ""
+    out_path = pathlib.Path(f"evaluation/multi_cr_results_f{fraction}{suffix}.json")
     out_path.write_text(json.dumps(output, indent=2))
     print(f"\nResults saved to {out_path}")

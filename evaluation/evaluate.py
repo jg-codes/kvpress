@@ -18,7 +18,7 @@ from datasets import load_dataset
 from evaluate_registry import DATASET_REGISTRY, PRESS_REGISTRY, SCORER_REGISTRY
 from fire import Fire
 from tqdm import tqdm
-from transformers import FineGrainedFP8Config, Pipeline, pipeline
+from transformers import FineGrainedFP8Config, Pipeline, QuantizedCache, pipeline
 
 from kvpress import (
     ComposedPress,
@@ -75,6 +75,7 @@ class EvaluationConfig:
 
     # Quantization
     fp8: bool = False
+    kv_nbits: int = 0
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -302,6 +303,12 @@ class EvaluationRunner:
         self.config.press_init_command = str(press)
         logger.info(f"KV Press '{press_name}' setup.")
 
+    def _make_cache(self):
+        """Create a fresh cache for each pipeline call. Returns QuantizedCache when kv_nbits > 0, else None."""
+        if self.config.kv_nbits > 0:
+            return QuantizedCache(backend="quanto", config=self.pipeline.model.config, nbits=self.config.kv_nbits)
+        return None
+
     def _load_and_prepare_dataset(self):
         """
         Loads the dataset specified in the config and applies sampling/filtering.
@@ -408,6 +415,7 @@ class EvaluationRunner:
                     press=self.press,
                     max_new_tokens=max_new_tokens,
                     max_context_length=self.config.max_context_length,
+                    cache=self._make_cache(),
                 )
                 self.df.loc[index, "predicted_answer"] = output["answer"]  # type: ignore[union-attr]
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
@@ -434,6 +442,7 @@ class EvaluationRunner:
                     press=self.press,
                     max_new_tokens=max_new_tokens,
                     max_context_length=self.config.max_context_length,
+                    cache=self._make_cache(),
                 )
                 self.df.loc[df_group.index, "predicted_answer"] = output["answers"]  # type: ignore[union-attr]
                 # Store the actual compression ratio used (if the press has one)

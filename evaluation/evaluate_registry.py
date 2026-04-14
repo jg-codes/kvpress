@@ -34,6 +34,8 @@ from kvpress import (
     KVzapPress,
     KVzipPress,
     LagKVPress,
+    MergingDecodingPress,
+    MergingPress,
     ObservedAttentionPress,
     PyramidKVPress,
     QFilterPress,
@@ -121,4 +123,24 @@ PRESS_REGISTRY = {
     "decoding_adakv_expected_attention_e2": DecodingPress(base_press=AdaKVPress(ExpectedAttentionPress(epsilon=1e-2))),
     "decoding_adakv_snapkv": DecodingPress(base_press=AdaKVPress(SnapKVPress())),
     "decoding_keydiff": DecodingPress(base_press=KeyDiffPress()),
+    # MergingPress: merge-on-evict during prefill (values-only merge preserves RoPE keys)
+    "merging_snapkv": MergingPress(SnapKVPress()),
+    "merging_vonorm_snapkv": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
+    "merging_vonorm_snapkv_t03": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.3
+    ),
+    "merging_vonorm_snapkv_t05": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.5
+    ),
+    "merging_vonorm_snapkv_t07": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.7
+    ),
+    "merging_vonorm_critical_snapkv": MergingPress(
+        CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True
+    ),
+    # MergingDecodingPress: merge-on-evict during decoding
+    "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
+    "merging_decoding_snapkv": MergingDecodingPress(base_press=SnapKVPress()),
+    # MergingPress + QuantizedCache: merge-on-evict with 4-bit KV quantization (use --kv_nbits=4)
+    "merging_vonorm_snapkv_q4": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
 }

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 
 import torch
@@ -25,7 +25,8 @@ def _merge_on_evict(
     merge_keys: bool,
     value_norm_weighting: bool,
     max_merge_per_token: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    collect_diagnostics: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Core merge-on-evict kernel shared by :class:`MergingPress` (prefill) and
     :class:`MergingDecodingPress` (decoding).
@@ -102,6 +103,8 @@ def _merge_on_evict(
     # --- Threshold gate ---
     merge_mask = max_sim >= similarity_threshold
     if not merge_mask.any():
+        if collect_diagnostics:
+            return kept_keys.contiguous(), kept_values.contiguous(), {"n_merged": 0, "n_evicted": n_evict * bsz * num_kv_heads}
         return kept_keys.contiguous(), kept_values.contiguous()
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -160,6 +163,23 @@ def _merge_on_evict(
     else:
         merged_keys = kept_keys
 
+    if collect_diagnostics:
+        n_merged = merge_mask.sum().item()
+        merge_count = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device)
+        merge_count.scatter_add_(2, target_idx, merge_mask.float())
+        diag = {
+            "n_merged": n_merged,
+            "n_evicted": n_evict * bsz * num_kv_heads,
+            "merge_ratio": n_merged / (n_evict * bsz * num_kv_heads),
+            "mean_sim": max_sim[merge_mask].mean().item(),
+            "min_sim": max_sim[merge_mask].min().item(),
+            "max_sim": max_sim[merge_mask].max().item(),
+            "mean_weight": evict_w[merge_mask].mean().item(),
+            "max_merges_per_survivor": merge_count.max().item(),
+            "mean_merges_per_active_survivor": merge_count[merge_count > 0].mean().item(),
+        }
+        return merged_keys.contiguous(), merged_values.contiguous(), diag
+
     return merged_keys.contiguous(), merged_values.contiguous()
 
 
@@ -187,15 +207,16 @@ class MergingPress(BasePress):
         for the merge to proceed.  Evicted tokens below this threshold are dropped
         without merging.  Because cosine similarity can be negative, ``threshold=0.0``
         still drops tokens whose keys point in the opposite direction of all survivors.
-    merge_keys : bool, default=True
-        Whether to merge evicted information into kept keys.  When ``False``, only
-        values are merged — kept keys are returned unchanged.  This preserves RoPE
-        positional encoding in the keys and can improve quality on models that use
-        rotary embeddings.
-    value_norm_weighting : bool, default=False
-        When ``True``, the merge weight for each evicted token is additionally scaled
-        by the relative L2 norm of its value vector.  This allocates more merge budget
-        to evicted tokens that carry high-magnitude value content.
+    merge_keys : bool, default=False
+        Whether to merge evicted information into kept keys.  When ``False`` (default),
+        only values are merged — kept keys are returned unchanged.  This preserves
+        RoPE positional encoding in the keys.  Empirically, ``merge_keys=True`` hurts
+        quality on RoPE models (−2.5 pp on RULER-4096 with Qwen3-8B at CR=0.75).
+    value_norm_weighting : bool, default=True
+        When ``True`` (default), the merge weight for each evicted token is additionally
+        scaled by the relative L2 norm of its value vector.  This allocates more merge
+        budget to evicted tokens that carry high-magnitude value content.  Empirically,
+        this improves accuracy by ~1.9 pp on RULER-4096.
     max_merge_per_token : int, default=0
         Maximum number of evicted tokens merged into any single survivor before
         weight scaling kicks in.  ``0`` (default) disables the cap.  When set,
@@ -205,9 +226,11 @@ class MergingPress(BasePress):
 
     press: ScorerPress
     similarity_threshold: float = 0.0
-    merge_keys: bool = True
-    value_norm_weighting: bool = False
+    merge_keys: bool = False
+    value_norm_weighting: bool = True
     max_merge_per_token: int = 0
+    collect_diagnostics: bool = False
+    diagnostics: list = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
@@ -246,10 +269,15 @@ class MergingPress(BasePress):
         if n_kept <= 0:
             return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
 
-        return _merge_on_evict(
+        result = _merge_on_evict(
             keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token,
+            self.max_merge_per_token, self.collect_diagnostics,
         )
+        if self.collect_diagnostics and len(result) == 3:
+            merged_keys, merged_values, diag = result
+            self.diagnostics.append(diag)
+            return merged_keys, merged_values
+        return result[:2]
 
 
 @dataclass
@@ -279,9 +307,10 @@ class MergingDecodingPress(DecodingPress):
         Maximum buffered hidden states for scoring context.
     similarity_threshold : float, default=0.0
         Minimum cosine similarity for a merge to proceed.
-    merge_keys : bool, default=True
-        Whether to merge evicted keys into survivors.
-    value_norm_weighting : bool, default=False
+    merge_keys : bool, default=False
+        Whether to merge evicted keys into survivors.  ``False`` (default)
+        preserves RoPE positional encoding.
+    value_norm_weighting : bool, default=True
         Scale merge weight by relative value-vector L2 norm.
     max_merge_per_token : int, default=0
         Maximum merges per survivor before weight scaling.  ``0`` disables.
@@ -292,8 +321,8 @@ class MergingDecodingPress(DecodingPress):
     target_size: int = 2048
     hidden_states_buffer_size: int = 256
     similarity_threshold: float = 0.0
-    merge_keys: bool = True
-    value_norm_weighting: bool = False
+    merge_keys: bool = False
+    value_norm_weighting: bool = True
     max_merge_per_token: int = 0
 
     def compress(

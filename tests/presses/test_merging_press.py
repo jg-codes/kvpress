@@ -115,7 +115,7 @@ class TestMergingPress:
         assert diff_hi <= diff_lo, f"High-threshold diff ({diff_hi}) > low-threshold diff ({diff_lo})"
 
     def test_keys_are_modified_by_merge(self, unit_test_model):  # noqa: F811
-        """Keys should also be modified by the score-weighted blending."""
+        """With merge_keys=True, keys should also be modified by the score-weighted blending."""
         torch.manual_seed(42)
         input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
 
@@ -125,7 +125,7 @@ class TestMergingPress:
             unit_test_model(input_ids.clone(), past_key_values=cache_hard)
 
         base2 = KnormPress(compression_ratio=0.5)
-        wrapper = MergingPress(press=base2, similarity_threshold=0.0)
+        wrapper = MergingPress(press=base2, similarity_threshold=0.0, merge_keys=True)
         with wrapper(unit_test_model):
             cache_merge = DynamicCache()
             unit_test_model(input_ids.clone(), past_key_values=cache_merge)
@@ -136,6 +136,27 @@ class TestMergingPress:
                 any_different = True
                 break
         assert any_different, "Merging did not modify keys"
+
+    def test_default_preserves_keys(self, unit_test_model):  # noqa: F811
+        """Default merge_keys=False should not modify keys (preserves RoPE)."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        with base(unit_test_model):
+            cache_hard = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_hard)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base2)  # defaults: merge_keys=False, value_norm_weighting=True
+        with wrapper(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        for i in range(len(cache_hard.layers)):
+            assert torch.equal(cache_hard.layers[i].keys, cache_merge.layers[i].keys), (
+                f"Layer {i}: default merge_keys=False should not modify keys"
+            )
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_half_precision_no_nan(self, unit_test_model, dtype):  # noqa: F811

@@ -124,7 +124,7 @@ PRESS_REGISTRY = {
     "decoding_adakv_snapkv": DecodingPress(base_press=AdaKVPress(SnapKVPress())),
     "decoding_keydiff": DecodingPress(base_press=KeyDiffPress()),
     # MergingPress: merge-on-evict during prefill (values-only merge preserves RoPE keys)
-    "merging_snapkv": MergingPress(SnapKVPress()),
+    "merging_snapkv": MergingPress(SnapKVPress(), merge_keys=True, value_norm_weighting=False),  # legacy config
     "merging_vonorm_knorm": MergingPress(KnormPress(), merge_keys=False, value_norm_weighting=True),
     "merging_vonorm_snapkv": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
     "merging_vonorm_snapkv_t03": MergingPress(

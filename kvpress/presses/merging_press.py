@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 
@@ -88,12 +88,16 @@ class MergingPress(BasePress):
         n_kept = int(k_len * (1 - self.press.compression_ratio))
         if n_kept >= k_len:
             return keys, values
+        if n_kept <= 0:
+            return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
         n_evict = k_len - n_kept
 
         # --- 2. Partition into keep / evict ---
         keep_idx = scores.topk(n_kept, dim=-1).indices  # (B, H, n_kept)
 
-        # Evict mask → evict indices (uniform n_evict per slice)
+        # Evict mask → evict indices (uniform n_evict per slice).
+        # nonzero() returns indices in row-major (C-contiguous) order, so the
+        # reshape below produces a correct (B, H, n_evict) partition.
         mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
         mask.scatter_(2, keep_idx, False)
         evict_idx = mask.nonzero(as_tuple=False)[:, 2].reshape(bsz, num_kv_heads, n_evict)

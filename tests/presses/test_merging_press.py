@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
@@ -289,3 +289,82 @@ class TestMergingPress:
         assert err_merge <= err_hard + 1e-6, (
             f"Merge error ({err_merge:.4f}) > hard eviction error ({err_hard:.4f})"
         )
+
+    def test_batch_size_greater_than_one(self, unit_test_model):  # noqa: F811
+        """The nonzero().reshape() partition must work correctly for batch_size > 1."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (2, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        assert cache.get_seq_length() == 32
+        for layer in cache.layers:
+            assert layer.keys.shape[0] == 2, "Batch dimension lost"
+            assert torch.isfinite(layer.keys).all()
+            assert torch.isfinite(layer.values).all()
+
+    def test_best_config_merge_keys_false_vnorm_true(self, unit_test_model):  # noqa: F811
+        """Combined merge_keys=False + value_norm_weighting=True (our best config)
+        should produce different values than either flag alone."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        def run_with(merge_keys, value_norm_weighting):
+            base = KnormPress(compression_ratio=0.5)
+            wrapper = MergingPress(
+                press=base,
+                similarity_threshold=0.0,
+                merge_keys=merge_keys,
+                value_norm_weighting=value_norm_weighting,
+            )
+            with wrapper(unit_test_model):
+                cache = DynamicCache()
+                unit_test_model(input_ids.clone(), past_key_values=cache)
+            return cache
+
+        cache_both = run_with(merge_keys=False, value_norm_weighting=True)
+        cache_vnorm_only = run_with(merge_keys=True, value_norm_weighting=True)
+        cache_nokeys_only = run_with(merge_keys=False, value_norm_weighting=False)
+
+        # Combined config should differ from vnorm-only (keys differ)
+        keys_differ = any(
+            not torch.equal(cache_both.layers[i].keys, cache_vnorm_only.layers[i].keys)
+            for i in range(len(cache_both.layers))
+        )
+        assert keys_differ, "merge_keys=False should produce different keys from merge_keys=True"
+
+        # Combined config should differ from nokeys-only (values differ due to vnorm)
+        vals_differ = any(
+            not torch.equal(cache_both.layers[i].values, cache_nokeys_only.layers[i].values)
+            for i in range(len(cache_both.layers))
+        )
+        assert vals_differ, "value_norm_weighting should change values"
+
+    def test_high_compression_short_sequence(self, unit_test_model):  # noqa: F811
+        """Very high compression on a short sequence must not crash."""
+        torch.manual_seed(42)
+        # 0.9 compression on 8 tokens → n_kept = int(8*0.1) = 0 → empty cache (guard hit)
+        input_ids = torch.randint(0, 1024, (1, 8), device=unit_test_model.device)
+        base = KnormPress(compression_ratio=0.9)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+        # n_kept==0 triggers the early-return guard; cache may be empty — just ensure no crash
+
+        # With a longer sequence, n_kept=1 → singleton merge, values must be finite
+        input_ids2 = torch.randint(0, 1024, (1, 16), device=unit_test_model.device)
+        base2 = KnormPress(compression_ratio=0.9)
+        wrapper2 = MergingPress(press=base2, similarity_threshold=0.0)
+        with wrapper2(unit_test_model):
+            cache2 = DynamicCache()
+            unit_test_model(input_ids2, past_key_values=cache2)
+        seq_len = cache2.get_seq_length()
+        assert seq_len >= 1, f"Cache is empty after high compression on 16 tokens: {seq_len}"
+        for layer in cache2.layers:
+            assert torch.isfinite(layer.keys).all()
+            assert torch.isfinite(layer.values).all()

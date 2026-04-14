@@ -21,6 +21,14 @@ import modal
 # ---------------------------------------------------------------------------
 # Modal setup — same image as modal_smoke.py but installs from latest branch
 # ---------------------------------------------------------------------------
+import os
+
+try:
+    hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
+except Exception:
+    _hf_token = os.environ.get("HF_TOKEN", "")
+    hf_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token}) if _hf_token else None
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
@@ -101,6 +109,7 @@ def build_jobs(fraction: float, model: str) -> list[tuple[str, float, float, str
     timeout=1800,
     memory=32768,
     scaledown_window=2,
+    secrets=[s for s in [hf_secret] if s is not None],
 )
 def run_one(press_name: str, cr: float, fraction: float, model: str) -> dict:
     """Run a single (variant, CR) evaluation and return metrics."""

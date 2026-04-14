@@ -21,6 +21,14 @@ import modal
 # ---------------------------------------------------------------------------
 # Modal image — needs enough VRAM for Qwen3-8B (~16 GB fp16, fits A100-40 GB)
 # ---------------------------------------------------------------------------
+import os
+
+try:
+    hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
+except Exception:
+    _hf_token = os.environ.get("HF_TOKEN", "")
+    hf_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token}) if _hf_token else None
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
@@ -107,6 +115,7 @@ def build_jobs(presses: list[str]) -> list[tuple[str, float]]:
     timeout=3600,
     memory=65536,
     scaledown_window=2,
+    secrets=[s for s in [hf_secret] if s is not None],
 )
 def run_one(press_name: str, cr: float) -> dict:
     """Run a single (variant, CR) leaderboard evaluation."""

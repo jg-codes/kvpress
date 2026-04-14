@@ -17,6 +17,7 @@ from kvpress import (
     KnormPress,
     KVzapPress,
     LeverageScorePress,
+    MergingDecodingPress,
     NonCausalAttnPress,
     PrefillDecodingPress,
     PyramidKVPress,
@@ -43,7 +44,19 @@ def make_cam_press(target_size: int, compression_interval: int, base_press: Scor
     )
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+def make_merging_decoding_press(target_size: int, compression_interval: int, base_press: ScorerPress):
+    return MergingDecodingPress(
+        base_press=base_press,
+        compression_interval=compression_interval,
+        target_size=target_size,
+    )
+
+
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 @pytest.mark.parametrize("token_buffer_size", [32, 64, 128])
 def test_decoding_compression(press_factory, token_buffer_size):
     """Test that decoding presses compress the cache during decoding."""
@@ -78,7 +91,11 @@ def test_decoding_compression(press_factory, token_buffer_size):
         )
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 def test_prefill_decoding_press_calls_both_phases(press_factory):
     """Test that PrefillDecodingPress calls both prefilling and decoding presses."""
 
@@ -113,7 +130,11 @@ def test_prefill_decoding_press_calls_both_phases(press_factory):
         )
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 def test_decoding_press_without_prefill(press_factory):
     """Test that decoding presses work correctly when used standalone (no prefill compression)."""
 
@@ -143,7 +164,11 @@ def test_decoding_press_without_prefill(press_factory):
         )
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 def test_prefill_decoding_press_decoding_only(press_factory):
     """Test PrefillDecodingPress with only decoding press (no prefill compression)."""
 
@@ -179,7 +204,11 @@ def test_prefill_decoding_press_decoding_only(press_factory):
         )
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 def test_decoding_press_equivalence(press_factory):
     """Test that DecodingPress standalone yields same result as PrefillDecodingPress with decoding only."""
 
@@ -237,7 +266,11 @@ E       RuntimeError: shape '[1, 2, 2, 6]' is invalid for input of size 12
 """
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 @pytest.mark.parametrize("press_config", default_presses)
 def test_all_presses_work_with_decoding_press(press_factory, press_config):
     """Test that all default presses work as base presses for DecodingPress."""
@@ -292,7 +325,11 @@ def test_all_presses_work_with_decoding_press(press_factory, press_config):
         ), f"{press_cls.__name__}: Layer {layer_idx} cache size {layer_seq_len} not in expected range [{target_size}-{max_expected_size}]"  # noqa: E501
 
 
-@pytest.mark.parametrize("press_factory", [make_decoding_press, make_cam_press], ids=["DecodingPress", "CAMPress"])
+@pytest.mark.parametrize(
+    "press_factory",
+    [make_decoding_press, make_cam_press, make_merging_decoding_press],
+    ids=["DecodingPress", "CAMPress", "MergingDecodingPress"],
+)
 def test_compression_actually_reduces_memory(press_factory):
     """Test that compression actually reduces memory usage compared to no compression."""
 

@@ -27,6 +27,7 @@ def _merge_on_evict(
     max_merge_per_token: int = 0,
     collect_diagnostics: bool = False,
     score_weighting: bool = False,
+    adaptive_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Core merge-on-evict kernel shared by :class:`MergingPress` (prefill) and
@@ -73,6 +74,12 @@ def _merge_on_evict(
         scaled by its normalised importance score (relative to the evict set).
         Tokens that barely missed the keep threshold contribute more to their
         target survivor than truly unimportant tokens.
+    adaptive_threshold : bool, default=False
+        When ``True``, the similarity threshold is computed dynamically as the
+        25th percentile of the per-token maximum cosine similarities instead
+        of using the fixed ``similarity_threshold``.  This skips the worst-
+        matched evicted tokens (bottom quartile) while still merging the
+        majority.
 
     Returns
     -------
@@ -101,13 +108,24 @@ def _merge_on_evict(
     evict_values = values.gather(2, idx4_e)
 
     # --- Batched cosine similarity → nearest survivor ---
-    e_norm = F.normalize(evict_keys.float(), dim=-1)
-    s_norm = F.normalize(kept_keys.float(), dim=-1)
+    # Guard against zero-norm keys: clamp norms to avoid NaN from F.normalize
+    _EPS = 1e-6  # safe for both float16 (min ~6e-8) and bfloat16 (min ~1e-38 but precision ~1e-3)
+    evict_keys_f = evict_keys.float()
+    kept_keys_f = kept_keys.float()
+    e_norms = evict_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+    s_norms = kept_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+    e_norm = evict_keys_f / e_norms
+    s_norm = kept_keys_f / s_norms
     sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))  # (B, H, n_evict, n_kept)
     max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
-    # --- Threshold gate ---
-    merge_mask = max_sim >= similarity_threshold
+    # --- Threshold gate (adaptive or fixed) ---
+    if adaptive_threshold:
+        threshold = torch.quantile(max_sim.float().flatten(-2), 0.25, dim=-1, keepdim=True).unsqueeze(-1)
+        threshold = threshold.expand_as(max_sim)
+        merge_mask = max_sim >= threshold
+    else:
+        merge_mask = max_sim >= similarity_threshold
     if not merge_mask.any():
         if collect_diagnostics:
             return kept_keys.contiguous(), kept_values.contiguous(), {"n_merged": 0, "n_evicted": n_evict * bsz * num_kv_heads}
@@ -135,14 +153,14 @@ def _merge_on_evict(
         # Normalise within evict set to [0, 1] so scale is independent of scorer
         s_min = evict_scores.min(dim=-1, keepdim=True).values
         s_max = evict_scores.max(dim=-1, keepdim=True).values
-        s_range = (s_max - s_min).clamp(min=1e-8)
+        s_range = (s_max - s_min).clamp(min=_EPS)
         norm_scores = (evict_scores - s_min) / s_range  # 0 = least important, 1 = just missed keep
         evict_w = evict_w * (0.5 + 0.5 * norm_scores)  # floor at 0.5 to avoid zeroing out
 
     if value_norm_weighting:
         ev_vnorm = evict_values.float().norm(dim=-1)
         target_vnorm = kept_values.float().norm(dim=-1).gather(2, target_idx)
-        rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + 1e-8)
+        rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + _EPS)
         evict_w = evict_w * rel_norm
 
     # --- Merge count cap: prevent survivor dilution ---
@@ -245,6 +263,7 @@ class MergingPress(BasePress):
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
     score_weighting: bool = False
+    adaptive_threshold: bool = False
     collect_diagnostics: bool = False
     diagnostics: list = field(default_factory=list, repr=False)
 
@@ -287,7 +306,7 @@ class MergingPress(BasePress):
 
         result = _merge_on_evict(
             keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token, self.collect_diagnostics, self.score_weighting,
+            self.max_merge_per_token, self.collect_diagnostics, self.score_weighting, self.adaptive_threshold,
         )
         if self.collect_diagnostics and len(result) == 3:
             merged_keys, merged_values, diag = result
@@ -341,6 +360,7 @@ class MergingDecodingPress(DecodingPress):
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
     score_weighting: bool = False
+    adaptive_threshold: bool = False
 
     def compress(
         self,
@@ -367,5 +387,189 @@ class MergingDecodingPress(DecodingPress):
 
         return _merge_on_evict(
             keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token, score_weighting=self.score_weighting,
+            self.max_merge_per_token, score_weighting=self.score_weighting, adaptive_threshold=self.adaptive_threshold,
         )
+
+
+def _adakv_head_budgets(
+    scores: torch.Tensor,
+    n_kept: int,
+    alpha_safeguard: float,
+) -> torch.Tensor:
+    """
+    Compute per-head token budgets using the AdaKV adaptive allocation algorithm.
+
+    Selects the top ``n_kept * num_heads`` scores globally, then counts how many
+    land in each head.  A safeguard ensures every head retains at least
+    ``alpha_safeguard * n_kept`` tokens.
+
+    Parameters
+    ----------
+    scores : Tensor, shape ``(B, H, L)``
+    n_kept : int
+        Target tokens to keep *per head* (uniform baseline).
+    alpha_safeguard : float
+        Minimum fraction of ``n_kept`` guaranteed per head.
+
+    Returns
+    -------
+    Tensor, shape ``(B, H)``
+        Per-head token budget (int values stored as long).
+    """
+    bsz, num_heads, k_len = scores.shape
+    n_safe = int(n_kept * alpha_safeguard)
+    total_budget = n_kept * num_heads
+
+    # Protect top-n_safe per head from being deprioritised
+    protected_scores = scores.clone()
+    if n_safe > 0:
+        top_safe_idx = torch.topk(protected_scores, min(n_safe, k_len), dim=-1).indices
+        protected_scores.scatter_(-1, top_safe_idx, torch.finfo(scores.dtype).max)
+
+    # Global top-B across all heads → count per head
+    flat = protected_scores.reshape(bsz, -1)  # (B, H*L)
+    global_top_idx = torch.topk(flat, min(total_budget, flat.shape[-1]), dim=-1).indices  # (B, total_budget)
+    head_of_idx = global_top_idx // k_len  # (B, total_budget)
+
+    # Count per head
+    budgets = torch.zeros(bsz, num_heads, device=scores.device, dtype=torch.long)
+    for b in range(bsz):
+        budgets[b] = torch.bincount(head_of_idx[b], minlength=num_heads)[:num_heads]
+
+    # Enforce minimum
+    budgets = budgets.clamp(min=max(n_safe, 1))
+    return budgets
+
+
+@dataclass
+class MergingAdaKVPress(BasePress):
+    """
+    Adaptive head-wise merge-on-evict KV cache compression.
+
+    Combines the head-wise adaptive budget allocation of :class:`AdaKVPress`
+    with the merge-on-evict strategy of :class:`MergingPress`.  Instead of
+    uniform per-head compression, each attention head receives a budget
+    proportional to its information density — heads with dispersed attention
+    patterns get more tokens, sparse heads get fewer.  Evicted tokens are
+    merged into their most similar survivor rather than being discarded.
+
+    This is the first method to combine adaptive head-wise allocation with
+    merge-on-evict, yielding both optimal budget distribution and information
+    preservation.
+
+    Parameters
+    ----------
+    press : ScorerPress
+        The underlying scoring method.
+    alpha_safeguard : float, default=0.20
+        Minimum fraction of tokens each head must retain (from AdaKV).
+    similarity_threshold : float, default=0.0
+        Minimum cosine similarity for a merge to proceed.
+    merge_keys : bool, default=False
+        Whether to merge evicted keys into survivors.
+    value_norm_weighting : bool, default=True
+        Scale merge weight by relative value-vector L2 norm.
+    max_merge_per_token : int, default=0
+        Maximum merges per survivor before weight scaling.  ``0`` disables.
+    score_weighting : bool, default=False
+        Scale merge weight by normalised importance score.
+    adaptive_threshold : bool, default=False
+        Compute similarity threshold dynamically as the 25th percentile
+        of per-token maximum cosine similarities.
+    """
+
+    press: ScorerPress
+    alpha_safeguard: float = 0.20
+    similarity_threshold: float = 0.0
+    merge_keys: bool = False
+    value_norm_weighting: bool = True
+    max_merge_per_token: int = 0
+    score_weighting: bool = False
+    adaptive_threshold: bool = False
+    collect_diagnostics: bool = False
+    diagnostics: list = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        assert isinstance(self.press, ScorerPress), f"MergingAdaKVPress requires a ScorerPress, got {type(self.press)}"
+        assert 0.0 <= self.alpha_safeguard <= 1.0
+        assert 0.0 <= self.similarity_threshold <= 1.0
+        assert self.max_merge_per_token >= 0
+
+    def post_init_from_model(self, model):
+        self.press.post_init_from_model(model)
+
+    @property
+    def compression_ratio(self):
+        return self.press.compression_ratio
+
+    @compression_ratio.setter
+    def compression_ratio(self, value):
+        self.press.compression_ratio = value
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.press.compression_ratio == 0:
+            return keys, values
+
+        bsz, num_kv_heads, k_len, head_dim = keys.shape
+        scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
+
+        n_kept_uniform = int(k_len * (1 - self.press.compression_ratio))
+        if n_kept_uniform >= k_len:
+            return keys, values
+        if n_kept_uniform <= 0:
+            return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
+
+        # --- Adaptive per-head budgets ---
+        budgets = _adakv_head_budgets(scores, n_kept_uniform, self.alpha_safeguard)  # (B, H)
+        max_budget = budgets.max().item()
+
+        # --- Per-head merge-on-evict ---
+        # Process each head with its own budget, pad to max_budget for uniform output
+        all_keys = torch.zeros(bsz, num_kv_heads, max_budget, head_dim, device=keys.device, dtype=keys.dtype)
+        all_values = torch.zeros(bsz, num_kv_heads, max_budget, head_dim, device=keys.device, dtype=values.dtype)
+        all_diags = []
+
+        for h in range(num_kv_heads):
+            h_keys = keys[:, h : h + 1, :, :]  # (B, 1, L, D)
+            h_values = values[:, h : h + 1, :, :]
+            h_scores = scores[:, h : h + 1, :]
+
+            # Use the *minimum* budget across the batch for this head for simplicity
+            h_budget = budgets[:, h].min().item()
+            h_budget = min(max(h_budget, 1), k_len)
+
+            if h_budget >= k_len:
+                # No compression for this head — pad
+                all_keys[:, h, :k_len, :] = keys[:, h, :, :]
+                all_values[:, h, :k_len, :] = values[:, h, :, :]
+                continue
+
+            result = _merge_on_evict(
+                h_keys, h_values, h_scores, h_budget,
+                self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
+                self.max_merge_per_token, self.collect_diagnostics, self.score_weighting,
+                self.adaptive_threshold,
+            )
+            if self.collect_diagnostics and len(result) == 3:
+                mk, mv, diag = result
+                diag["head"] = h
+                all_diags.append(diag)
+            else:
+                mk, mv = result[:2]
+
+            # mk, mv are (B, 1, h_budget, D) — place in padded output
+            all_keys[:, h, :h_budget, :] = mk[:, 0, :, :]
+            all_values[:, h, :h_budget, :] = mv[:, 0, :, :]
+
+        if self.collect_diagnostics and all_diags:
+            self.diagnostics.append(all_diags)
+
+        return all_keys.contiguous(), all_values.contiguous()

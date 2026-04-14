@@ -34,6 +34,7 @@ from kvpress import (
     KVzapPress,
     KVzipPress,
     LagKVPress,
+    MergingAdaKVPress,
     MergingDecodingPress,
     MergingPress,
     ObservedAttentionPress,
@@ -166,6 +167,35 @@ PRESS_REGISTRY = {
     "merging_simonly_snapkv": MergingPress(
         SnapKVPress(), merge_keys=False, value_norm_weighting=False, score_weighting=False
     ),
+    # MergingPress with adaptive threshold (25th percentile of per-token max cosine sims)
+    "merging_adaptive_knorm": MergingPress(
+        KnormPress(), merge_keys=False, value_norm_weighting=True, adaptive_threshold=True
+    ),
+    "merging_adaptive_snapkv": MergingPress(
+        SnapKVPress(), merge_keys=False, value_norm_weighting=True, adaptive_threshold=True
+    ),
+    # MergingPress wrapping top-of-leaderboard scorers (orthogonality test)
+    "merging_expected_attention": MergingPress(
+        ExpectedAttentionPress(epsilon=1e-2), merge_keys=False, value_norm_weighting=True
+    ),
+    "merging_tova": MergingPress(TOVAPress(), merge_keys=False, value_norm_weighting=True),
+    "merging_observed_attention": MergingPress(
+        ObservedAttentionPress(), merge_keys=False, value_norm_weighting=True
+    ),
+    "merging_compactor": MergingPress(CompactorPress(), merge_keys=False, value_norm_weighting=True),
+    "merging_kvzap_mlp": MergingPress(
+        KVzapPress(model_type="mlp"), merge_keys=False, value_norm_weighting=True
+    ),
+    "merging_kvzap_linear": MergingPress(
+        KVzapPress(model_type="linear"), merge_keys=False, value_norm_weighting=True
+    ),
+    # MergingAdaKVPress: adaptive head-wise budgets + merge-on-evict
+    "merging_adakv_knorm": MergingAdaKVPress(KnormPress()),
+    "merging_adakv_snapkv": MergingAdaKVPress(SnapKVPress()),
+    "merging_adakv_snapkv_score": MergingAdaKVPress(SnapKVPress(), score_weighting=True),
+    "merging_adakv_critical_snapkv": MergingAdaKVPress(CriticalKVPress(SnapKVPress())),
+    "merging_adakv_expected_attention": MergingAdaKVPress(ExpectedAttentionPress(epsilon=1e-2)),
+    "merging_adakv_kvzap_mlp": MergingAdaKVPress(KVzapPress(model_type="mlp")),
     # MergingDecodingPress: merge-on-evict during decoding
     "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
     "merging_decoding_snapkv": MergingDecodingPress(base_press=SnapKVPress()),

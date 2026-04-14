@@ -7,7 +7,7 @@ from transformers import DynamicCache, QuantizedCache
 from transformers.utils import is_optimum_quanto_available
 
 from kvpress import KnormPress, SnapKVPress
-from kvpress.presses.merging_press import MergingPress
+from kvpress.presses.merging_press import MergingAdaKVPress, MergingPress
 from tests.fixtures import unit_test_model  # noqa: F401
 
 
@@ -464,4 +464,140 @@ class TestMergingPress:
             for i in range(len(cache_plain.layers))
         )
         assert any_different, "score_weighting did not change merge results"
-# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+    def test_adaptive_threshold_changes_output(self, unit_test_model):  # noqa: F811
+        """adaptive_threshold=True should produce different merge results from fixed threshold."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_fixed = MergingPress(press=base1, adaptive_threshold=False)
+        with wrap_fixed(unit_test_model):
+            cache_fixed = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_fixed)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_adaptive = MergingPress(press=base2, adaptive_threshold=True)
+        with wrap_adaptive(unit_test_model):
+            cache_adaptive = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_adaptive)
+
+        any_different = any(
+            not torch.equal(cache_fixed.layers[i].values, cache_adaptive.layers[i].values)
+            for i in range(len(cache_fixed.layers))
+        )
+        assert any_different, "adaptive_threshold did not change merge results"
+
+    def test_adaptive_threshold_no_nan(self, unit_test_model):  # noqa: F811
+        """adaptive_threshold should produce finite values."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.7)
+        wrapper = MergingPress(press=base, adaptive_threshold=True)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), "Non-finite keys with adaptive_threshold"
+            assert torch.isfinite(layer.values).all(), "Non-finite values with adaptive_threshold"
+
+
+class TestMergingAdaKVPress:
+    def test_requires_scorer_press(self):
+        with pytest.raises(AssertionError, match="requires a ScorerPress"):
+            MergingAdaKVPress(press="not_a_press")
+
+    def test_compression_ratio_delegation(self):
+        base = KnormPress(compression_ratio=0.3)
+        wrapper = MergingAdaKVPress(press=base)
+        assert wrapper.compression_ratio == 0.3
+        wrapper.compression_ratio = 0.6
+        assert base.compression_ratio == 0.6
+
+    def test_zero_compression_is_identity(self, unit_test_model):  # noqa: F811
+        base = KnormPress(compression_ratio=0.0)
+        wrapper = MergingAdaKVPress(press=base)
+        with wrapper(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+            assert cache.get_seq_length() == 64
+
+    @pytest.mark.parametrize("base_cls", [KnormPress, SnapKVPress])
+    def test_runs_with_model(self, unit_test_model, base_cls):  # noqa: F811
+        if base_cls == SnapKVPress:
+            base = base_cls(compression_ratio=0.5, window_size=2)
+        else:
+            base = base_cls(compression_ratio=0.5)
+        wrapper = MergingAdaKVPress(press=base)
+        with wrapper(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+            # Per-head budgets vary, so seq_length is max_budget (could be >= n_kept_uniform)
+            assert cache.get_seq_length() > 0
+            for layer in cache.layers:
+                assert torch.isfinite(layer.keys).all()
+                assert torch.isfinite(layer.values).all()
+
+    def test_differs_from_uniform_merging(self, unit_test_model):  # noqa: F811
+        """MergingAdaKV should differ from uniform MergingPress due to per-head budgets."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_uniform = MergingPress(press=base1)
+        with wrap_uniform(unit_test_model):
+            cache_uniform = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_uniform)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_adakv = MergingAdaKVPress(press=base2)
+        with wrap_adakv(unit_test_model):
+            cache_adakv = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_adakv)
+
+        # At least one difference should exist (head budgets differ from uniform)
+        any_different = any(
+            not torch.equal(cache_uniform.layers[i].values, cache_adakv.layers[i].values)
+            for i in range(len(cache_uniform.layers))
+        )
+        assert any_different, "MergingAdaKV produced identical values to uniform MergingPress"
+
+    def test_half_precision_no_nan(self, unit_test_model):  # noqa: F811
+        """MergingAdaKV should produce finite values in bfloat16."""
+        model = unit_test_model.to(torch.bfloat16)
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingAdaKVPress(press=base)
+        with wrapper(model):
+            cache = DynamicCache()
+            model(input_ids, past_key_values=cache)
+
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), "Non-finite keys in MergingAdaKV bfloat16"
+            assert torch.isfinite(layer.values).all(), "Non-finite values in MergingAdaKV bfloat16"
+        model.float()
+
+    def test_alpha_safeguard_bounds(self):
+        with pytest.raises(AssertionError):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), alpha_safeguard=-0.1)
+        with pytest.raises(AssertionError):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), alpha_safeguard=1.1)
+
+    def test_diagnostics(self, unit_test_model):  # noqa: F811
+        """collect_diagnostics=True should record per-head diagnostics."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingAdaKVPress(press=base, collect_diagnostics=True)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        assert len(wrapper.diagnostics) > 0, "No diagnostics collected"

@@ -38,6 +38,7 @@ from kvpress import (
     MergingDecodingPress,
     MergingPress,
     ObservedAttentionPress,
+    PrefillDecodingPress,
     PyramidKVPress,
     QFilterPress,
     RandomPress,
@@ -125,80 +126,19 @@ PRESS_REGISTRY = {
     "decoding_adakv_snapkv": DecodingPress(base_press=AdaKVPress(SnapKVPress())),
     "decoding_keydiff": DecodingPress(base_press=KeyDiffPress()),
     # MergingPress: merge-on-evict during prefill (values-only merge preserves RoPE keys)
-    "merging_snapkv": MergingPress(SnapKVPress(), merge_keys=True, value_norm_weighting=False),  # legacy config
-    "merging_vonorm_knorm": MergingPress(KnormPress(), merge_keys=False, value_norm_weighting=True),
-    "merging_vonorm_snapkv": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
-    "merging_vonorm_snapkv_t03": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.3
-    ),
-    "merging_vonorm_snapkv_t05": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.5
-    ),
-    "merging_vonorm_snapkv_t07": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, similarity_threshold=0.7
-    ),
-    # max_merge_per_token sweep variants (snapkv scorer, vonorm config)
-    "merging_vonorm_snapkv_m1": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=1
-    ),
-    "merging_vonorm_snapkv_m3": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=3
-    ),
-    "merging_vonorm_snapkv_m5": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, max_merge_per_token=5
-    ),
-    "merging_vonorm_critical_snapkv": MergingPress(
-        CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True
-    ),
-    # Score-weighted merge variants (evicted token importance modulates merge contribution)
-    "merging_score_knorm": MergingPress(
-        KnormPress(), merge_keys=False, value_norm_weighting=True, score_weighting=True
-    ),
-    "merging_score_snapkv": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, score_weighting=True
-    ),
-    "merging_score_critical_snapkv": MergingPress(
-        CriticalKVPress(SnapKVPress()), merge_keys=False, value_norm_weighting=True, score_weighting=True
-    ),
-    # Ablation: similarity-only (no value norm weighting, no score weighting)
-    "merging_simonly_knorm": MergingPress(
-        KnormPress(), merge_keys=False, value_norm_weighting=False, score_weighting=False
-    ),
-    "merging_simonly_snapkv": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=False, score_weighting=False
-    ),
-    # MergingPress with adaptive threshold (25th percentile of per-token max cosine sims)
-    "merging_adaptive_knorm": MergingPress(
-        KnormPress(), merge_keys=False, value_norm_weighting=True, adaptive_threshold=True
-    ),
-    "merging_adaptive_snapkv": MergingPress(
-        SnapKVPress(), merge_keys=False, value_norm_weighting=True, adaptive_threshold=True
-    ),
-    # MergingPress wrapping top-of-leaderboard scorers (orthogonality test)
-    "merging_expected_attention": MergingPress(
-        ExpectedAttentionPress(epsilon=1e-2), merge_keys=False, value_norm_weighting=True
-    ),
-    "merging_tova": MergingPress(TOVAPress(), merge_keys=False, value_norm_weighting=True),
-    "merging_observed_attention": MergingPress(
-        ObservedAttentionPress(), merge_keys=False, value_norm_weighting=True
-    ),
-    "merging_compactor": MergingPress(CompactorPress(), merge_keys=False, value_norm_weighting=True),
-    "merging_kvzap_mlp": MergingPress(
-        KVzapPress(model_type="mlp"), merge_keys=False, value_norm_weighting=True
-    ),
-    "merging_kvzap_linear": MergingPress(
-        KVzapPress(model_type="linear"), merge_keys=False, value_norm_weighting=True
-    ),
+    "merging_knorm": MergingPress(KnormPress()),
+    "merging_snapkv": MergingPress(SnapKVPress()),
+    "merging_critical_snapkv": MergingPress(CriticalKVPress(SnapKVPress())),
+    "merging_expected_attention": MergingPress(ExpectedAttentionPress(epsilon=1e-2)),
+    "merging_kvzap_mlp": MergingPress(KVzapPress(model_type="mlp")),
     # MergingAdaKVPress: adaptive head-wise budgets + merge-on-evict
-    "merging_adakv_knorm": MergingAdaKVPress(KnormPress()),
     "merging_adakv_snapkv": MergingAdaKVPress(SnapKVPress()),
-    "merging_adakv_snapkv_score": MergingAdaKVPress(SnapKVPress(), score_weighting=True),
-    "merging_adakv_critical_snapkv": MergingAdaKVPress(CriticalKVPress(SnapKVPress())),
-    "merging_adakv_expected_attention": MergingAdaKVPress(ExpectedAttentionPress(epsilon=1e-2)),
-    "merging_adakv_kvzap_mlp": MergingAdaKVPress(KVzapPress(model_type="mlp")),
     # MergingDecodingPress: merge-on-evict during decoding
     "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
     "merging_decoding_snapkv": MergingDecodingPress(base_press=SnapKVPress()),
-    # MergingPress + QuantizedCache: merge-on-evict with 4-bit KV quantization (use --kv_nbits=4)
-    "merging_vonorm_snapkv_q4": MergingPress(SnapKVPress(), merge_keys=False, value_norm_weighting=True),
+    # PrefillDecoding stacking: MergingPress (prefill) + CAMPress (decode)
+    "merging_cam_knorm": PrefillDecodingPress(
+        prefilling_press=MergingPress(KnormPress()),
+        decoding_press=CAMPress(base_press=KnormPress()),
+    ),
 }

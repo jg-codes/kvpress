@@ -59,21 +59,17 @@ PREFILL_VARIANTS = [
     "knorm",
     "snapkv",
     "critical_snapkv",
-    "merging_vonorm_knorm",
-    "merging_vonorm_snapkv",
-    "merging_vonorm_critical_snapkv",
+    "merging_knorm",
+    "merging_snapkv",
+    "merging_critical_snapkv",
+    "merging_adakv_snapkv",
+    "merging_cam_knorm",
 ]
 
-# Hyperparameter sweep variants (similarity_threshold + max_merge_per_token)
+# Hyperparameter sweep variants (not in registry — define inline in build_jobs if needed)
 SWEEP_VARIANTS = [
-    "snapkv",                        # baseline (already in PREFILL but needed for comparison)
-    "merging_vonorm_snapkv",         # threshold=0.0, max_merge=0 (default)
-    "merging_vonorm_snapkv_t03",     # threshold=0.3
-    "merging_vonorm_snapkv_t05",     # threshold=0.5
-    "merging_vonorm_snapkv_t07",     # threshold=0.7
-    "merging_vonorm_snapkv_m1",      # max_merge_per_token=1
-    "merging_vonorm_snapkv_m3",      # max_merge_per_token=3
-    "merging_vonorm_snapkv_m5",      # max_merge_per_token=5
+    "snapkv",
+    "merging_snapkv",
 ]
 
 CRS = [0.25, 0.50, 0.75, 0.875]
@@ -145,38 +141,33 @@ def compute_ci(scores: list[float], n: int = 1000, seed: int = 42) -> tuple[floa
 
     random.seed(seed)
     mean = sum(scores) / len(scores) if scores else 0.0
-    boot = sorted(
-        sum(random.choices(scores, k=len(scores))) / len(scores)
-        for _ in range(n)
-    )
+    boot = sorted(sum(random.choices(scores, k=len(scores))) / len(scores) for _ in range(n))
     return mean, boot[int(0.025 * n)], boot[int(0.975 * n)]
 
 
 def paired_bootstrap_ci(
-    base_tasks: dict[str, float], merge_tasks: dict[str, float],
-    n: int = 10000, seed: int = 42,
+    base_tasks: dict[str, float],
+    merge_tasks: dict[str, float],
+    n: int = 10000,
+    seed: int = 42,
 ) -> dict:
     """Paired bootstrap 95% CI for delta (merging − baseline) over shared tasks.
 
     Returns dict with mean_delta, ci_lo, ci_hi, p_value (two-sided),
     sign_test_p, and n_tasks.
     """
-    import math
     import random
 
     shared = sorted(set(base_tasks) & set(merge_tasks))
     deltas = [merge_tasks[t] - base_tasks[t] for t in shared]
     k = len(deltas)
     if k == 0:
-        return {"mean_delta": 0, "ci_lo": 0, "ci_hi": 0, "p_value": 1.0,
-                "sign_test_p": 1.0, "n_tasks": 0}
+        return {"mean_delta": 0, "ci_lo": 0, "ci_hi": 0, "p_value": 1.0, "sign_test_p": 1.0, "n_tasks": 0}
 
     observed = sum(deltas) / k
 
     random.seed(seed)
-    boot_means = sorted(
-        sum(random.choices(deltas, k=k)) / k for _ in range(n)
-    )
+    boot_means = sorted(sum(random.choices(deltas, k=k)) / k for _ in range(n))
     ci_lo = boot_means[int(0.025 * n)]
     ci_hi = boot_means[int(0.975 * n)]
 
@@ -194,8 +185,9 @@ def paired_bootstrap_ci(
     if n_nonzero > 0:
         # Two-sided: P(X >= max(pos,neg)) under Binom(n_nonzero, 0.5)
         from math import comb
+
         tail_count = max(pos, neg)
-        sign_p = 2 * sum(comb(n_nonzero, i) for i in range(tail_count, n_nonzero + 1)) / (2 ** n_nonzero)
+        sign_p = 2 * sum(comb(n_nonzero, i) for i in range(tail_count, n_nonzero + 1)) / (2**n_nonzero)
         sign_p = min(sign_p, 1.0)
     else:
         sign_p = 1.0
@@ -277,26 +269,34 @@ def main(fraction: float = 0.001, sweep: bool = False):
     # Detect all merging wrapper pairs dynamically
     pairs = []
     seen_bases = set()
+    MERGE_PREFIX = "merging_"
     for label, r in table.items():
         pn = r["press_name"]
-        if pn.startswith("merging_vonorm_"):
-            # Extract the base scorer name after the prefix
-            base = pn[len("merging_vonorm_"):]
+        if (
+            pn.startswith(MERGE_PREFIX)
+            and not pn.startswith("merging_adakv_")
+            and not pn.startswith("merging_cam_")
+            and not pn.startswith("merging_decoding_")
+        ):
+            base = pn[len(MERGE_PREFIX) :]
             if base not in seen_bases:
                 pairs.append((base, pn))
                 seen_bases.add(base)
     # Fallback to known pairs if detection fails
     if not pairs:
         pairs = [
-            ("knorm", "merging_vonorm_knorm"),
-            ("snapkv", "merging_vonorm_snapkv"),
-            ("critical_snapkv", "merging_vonorm_critical_snapkv"),
+            ("knorm", "merging_knorm"),
+            ("snapkv", "merging_snapkv"),
+            ("critical_snapkv", "merging_critical_snapkv"),
         ]
 
     print(f"\n{'='*100}")
     print("Paired Bootstrap Comparison (merging delta over baseline)")
     print(f"{'-'*100}")
-    print(f"{'Scorer':<20} {'CR':>5} {'Base':>6} {'Merg':>6} {'Delta':>7} {'95% CI':>16} {'p_boot':>7} {'p_sign':>7} {'W/L/T':>7}")
+    print(
+        f"{'Scorer':<20} {'CR':>5} {'Base':>6} {'Merg':>6}"
+        f" {'Delta':>7} {'95% CI':>16} {'p_boot':>7} {'p_sign':>7} {'W/L/T':>7}"
+    )
     print(f"{'-'*100}")
 
     paired_results = []
@@ -308,15 +308,21 @@ def main(fraction: float = 0.001, sweep: bool = False):
                 b = table[base_label]
                 m = table[merge_label]
                 pr = paired_bootstrap_ci(b["per_task"], m["per_task"])
-                paired_results.append({"scorer": base_name, "cr": cr, **pr,
-                                        "base_mean": b["mean"], "merge_mean": m["mean"]})
+                paired_results.append(
+                    {"scorer": base_name, "cr": cr, **pr, "base_mean": b["mean"], "merge_mean": m["mean"]}
+                )
                 ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                 sig_mark = "*" if pr["p_value"] < 0.05 else " "
                 wlt = f"{pr['positive']}/{pr['negative']}/{pr['tied']}"
-                print(f"{base_name:<20} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+7.1f} {ci_str:>16} {pr['p_value']:>7.4f}{sig_mark}{pr['sign_test_p']:>7.4f} {wlt:>7}")
+                print(
+                    f"{base_name:<20} {cr:>5.2f} {b['mean']:>6.1f}"
+                    f" {m['mean']:>6.1f} {pr['mean_delta']:>+7.1f}"
+                    f" {ci_str:>16} {pr['p_value']:>7.4f}{sig_mark}"
+                    f"{pr['sign_test_p']:>7.4f} {wlt:>7}"
+                )
 
     print(f"{'-'*100}")
-    print(f"  * = p < 0.05 (paired bootstrap, B=10000)")
+    print("  * = p < 0.05 (paired bootstrap, B=10000)")
     print(f"{'='*100}")
 
     # Save JSON

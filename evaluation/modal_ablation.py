@@ -16,18 +16,15 @@ Usage:
 
 import json
 
-import modal
-
 # ---------------------------------------------------------------------------
 # Modal setup — same image as modal_smoke.py but installs from latest branch
 # ---------------------------------------------------------------------------
 import os
 
-try:
-    hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
-except Exception:
-    _hf_token = os.environ.get("HF_TOKEN", "")
-    hf_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token}) if _hf_token else None
+import modal
+
+_hf_token = os.environ.get("HF_TOKEN", "")
+_secrets = [modal.Secret.from_dict({"HF_TOKEN": _hf_token})] if _hf_token else []
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -109,7 +106,7 @@ def build_jobs(fraction: float, model: str) -> list[tuple[str, float, float, str
     timeout=1800,
     memory=32768,
     scaledown_window=2,
-    secrets=[s for s in [hf_secret] if s is not None],
+    secrets=_secrets,
 )
 def run_one(press_name: str, cr: float, fraction: float, model: str) -> dict:
     """Run a single (variant, CR) evaluation and return metrics."""
@@ -159,16 +156,15 @@ def compute_ci(scores: list[float], n: int = 1000, seed: int = 42) -> tuple[floa
 
     random.seed(seed)
     mean = sum(scores) / len(scores) if scores else 0.0
-    boot = sorted(
-        sum(random.choices(scores, k=len(scores))) / len(scores)
-        for _ in range(n)
-    )
+    boot = sorted(sum(random.choices(scores, k=len(scores))) / len(scores) for _ in range(n))
     return mean, boot[int(0.025 * n)], boot[int(0.975 * n)]
 
 
 def paired_bootstrap_ci(
-    base_tasks: dict[str, float], merge_tasks: dict[str, float],
-    n: int = 10000, seed: int = 42,
+    base_tasks: dict[str, float],
+    merge_tasks: dict[str, float],
+    n: int = 10000,
+    seed: int = 42,
 ) -> dict:
     """Paired bootstrap 95% CI for delta (merging − baseline) over shared tasks."""
     import random
@@ -178,15 +174,12 @@ def paired_bootstrap_ci(
     deltas = [merge_tasks[t] - base_tasks[t] for t in shared]
     k = len(deltas)
     if k == 0:
-        return {"mean_delta": 0, "ci_lo": 0, "ci_hi": 0, "p_value": 1.0,
-                "sign_test_p": 1.0, "n_tasks": 0}
+        return {"mean_delta": 0, "ci_lo": 0, "ci_hi": 0, "p_value": 1.0, "sign_test_p": 1.0, "n_tasks": 0}
 
     observed = sum(deltas) / k
 
     random.seed(seed)
-    boot_means = sorted(
-        sum(random.choices(deltas, k=k)) / k for _ in range(n)
-    )
+    boot_means = sorted(sum(random.choices(deltas, k=k)) / k for _ in range(n))
     ci_lo = boot_means[int(0.025 * n)]
     ci_hi = boot_means[int(0.975 * n)]
 
@@ -201,7 +194,7 @@ def paired_bootstrap_ci(
     n_nonzero = pos + neg
     if n_nonzero > 0:
         tail_count = max(pos, neg)
-        sign_p = 2 * sum(comb(n_nonzero, i) for i in range(tail_count, n_nonzero + 1)) / (2 ** n_nonzero)
+        sign_p = 2 * sum(comb(n_nonzero, i) for i in range(tail_count, n_nonzero + 1)) / (2**n_nonzero)
         sign_p = min(sign_p, 1.0)
     else:
         sign_p = 1.0
@@ -287,7 +280,9 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
     print(f"\n{'='*115}")
     print("Paired Bootstrap: merge variant delta over baseline scorer")
     print(f"{'-'*115}")
-    print(f"{'Config':<18} {'Scorer':<20} {'CR':>5} {'Base':>6} {'Merg':>6} {'Δ':>6} {'95% CI':>16} {'p':>7} {'W/L/T':>7}")
+    print(
+        f"{'Config':<18} {'Scorer':<20} {'CR':>5} {'Base':>6} {'Merg':>6} {'Δ':>6} {'95% CI':>16} {'p':>7} {'W/L/T':>7}"
+    )
     print(f"{'-'*115}")
 
     paired_results = []
@@ -301,14 +296,22 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                     b = table[base_label]
                     m = table[merge_label]
                     pr = paired_bootstrap_ci(b["per_task"], m["per_task"])
-                    paired_results.append({
-                        "config": config_name, "scorer": scorer, "cr": cr, **pr,
-                        "base_mean": b["mean"], "merge_mean": m["mean"],
-                    })
+                    paired_results.append(
+                        {
+                            "config": config_name,
+                            "scorer": scorer,
+                            "cr": cr,
+                            **pr,
+                            "base_mean": b["mean"],
+                            "merge_mean": m["mean"],
+                        }
+                    )
                     ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                     sig = "*" if pr["p_value"] < 0.05 else " "
                     wlt = f"{pr['positive']}/{pr['negative']}/{pr['tied']}"
-                    print(f"{config_name:<18} {scorer:<20} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig} {wlt:>7}")
+                    print(
+                        f"{config_name:<18} {scorer:<20} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig} {wlt:>7}"
+                    )
 
     # --- Head-to-head: vonorm vs score (same scorer, same CR) ---
     print(f"\n{'='*115}")
@@ -326,13 +329,20 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                 v = table[v_label]
                 s = table[s_label]
                 pr = paired_bootstrap_ci(v["per_task"], s["per_task"])
-                h2h_results.append({
-                    "scorer": scorer, "cr": cr, **pr,
-                    "vonorm_mean": v["mean"], "score_mean": s["mean"],
-                })
+                h2h_results.append(
+                    {
+                        "scorer": scorer,
+                        "cr": cr,
+                        **pr,
+                        "vonorm_mean": v["mean"],
+                        "score_mean": s["mean"],
+                    }
+                )
                 ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                 sig = "*" if pr["p_value"] < 0.05 else " "
-                print(f"{scorer:<20} {cr:>5.2f} {v['mean']:>6.1f} {s['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}")
+                print(
+                    f"{scorer:<20} {cr:>5.2f} {v['mean']:>6.1f} {s['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
+                )
 
     # --- Head-to-head: MergingAdaKV vs AdaKV (does merge help on top of adaptive allocation?) ---
     print(f"\n{'='*115}")
@@ -351,13 +361,21 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                 b = table[b_label]
                 m = table[m_label]
                 pr = paired_bootstrap_ci(b["per_task"], m["per_task"])
-                adakv_h2h.append({
-                    "base": base_name, "merge": merge_name, "cr": cr, **pr,
-                    "base_mean": b["mean"], "merge_mean": m["mean"],
-                })
+                adakv_h2h.append(
+                    {
+                        "base": base_name,
+                        "merge": merge_name,
+                        "cr": cr,
+                        **pr,
+                        "base_mean": b["mean"],
+                        "merge_mean": m["mean"],
+                    }
+                )
                 ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                 sig = "*" if pr["p_value"] < 0.05 else " "
-                print(f"{base_name} vs {merge_name:<15} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}")
+                print(
+                    f"{base_name} vs {merge_name:<15} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
+                )
 
     print(f"{'='*115}")
 

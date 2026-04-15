@@ -154,9 +154,9 @@ class TestMergingPress:
             unit_test_model(input_ids.clone(), past_key_values=cache_merge)
 
         for i in range(len(cache_hard.layers)):
-            assert torch.equal(cache_hard.layers[i].keys, cache_merge.layers[i].keys), (
-                f"Layer {i}: default merge_keys=False should not modify keys"
-            )
+            assert torch.equal(
+                cache_hard.layers[i].keys, cache_merge.layers[i].keys
+            ), f"Layer {i}: default merge_keys=False should not modify keys"
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_half_precision_no_nan(self, unit_test_model, dtype):  # noqa: F811
@@ -200,9 +200,9 @@ class TestMergingPress:
             assert torch.isfinite(layer.keys).all(), "Non-finite keys after repeated compression"
             assert torch.isfinite(layer.values).all(), "Non-finite values after repeated compression"
 
-        assert seq_lengths[-1] < 128 + 3 * 16, (
-            f"Cache grew to {seq_lengths[-1]} — compression not applied during recompression rounds"
-        )
+        assert (
+            seq_lengths[-1] < 128 + 3 * 16
+        ), f"Cache grew to {seq_lengths[-1]} — compression not applied during recompression rounds"
 
     def test_merge_keys_false_preserves_keys(self, unit_test_model):  # noqa: F811
         """With merge_keys=False, keys should be identical to hard eviction."""
@@ -221,9 +221,9 @@ class TestMergingPress:
             unit_test_model(input_ids.clone(), past_key_values=cache_merge)
 
         for i in range(len(cache_hard.layers)):
-            assert torch.equal(cache_hard.layers[i].keys, cache_merge.layers[i].keys), (
-                f"Layer {i}: keys differ when merge_keys=False"
-            )
+            assert torch.equal(
+                cache_hard.layers[i].keys, cache_merge.layers[i].keys
+            ), f"Layer {i}: keys differ when merge_keys=False"
 
         any_different = False
         for i in range(len(cache_hard.layers)):
@@ -286,9 +286,7 @@ class TestMergingPress:
         err_hard = value_reconstruction_error(cache_hard)
         err_merge = value_reconstruction_error(cache_merge)
 
-        assert err_merge <= err_hard + 1e-6, (
-            f"Merge error ({err_merge:.4f}) > hard eviction error ({err_hard:.4f})"
-        )
+        assert err_merge <= err_hard + 1e-6, f"Merge error ({err_merge:.4f}) > hard eviction error ({err_hard:.4f})"
 
     def test_batch_size_greater_than_one(self, unit_test_model):  # noqa: F811
         """The nonzero().reshape() partition must work correctly for batch_size > 1."""
@@ -399,9 +397,7 @@ class TestMergingPress:
         diff_uncapped = max_value_diff(cache_uncapped, cache_hard)
         diff_capped = max_value_diff(cache_capped, cache_hard)
 
-        assert diff_capped <= diff_uncapped + 1e-6, (
-            f"Capped diff ({diff_capped}) > uncapped diff ({diff_uncapped})"
-        )
+        assert diff_capped <= diff_uncapped + 1e-6, f"Capped diff ({diff_capped}) > uncapped diff ({diff_uncapped})"
 
     def test_high_compression_short_sequence(self, unit_test_model):  # noqa: F811
         """Very high compression on a short sequence must not crash."""
@@ -503,6 +499,64 @@ class TestMergingPress:
             assert torch.isfinite(layer.keys).all(), "Non-finite keys with adaptive_threshold"
             assert torch.isfinite(layer.values).all(), "Non-finite values with adaptive_threshold"
 
+    def test_adaptive_percentile_changes_output(self, unit_test_model):  # noqa: F811
+        """Non-default adaptive_percentile should change merge results."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_default = MergingPress(press=base1, adaptive_threshold=True, adaptive_percentile=0.25)
+        with wrap_default(unit_test_model):
+            cache_default = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_default)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_strict = MergingPress(press=base2, adaptive_threshold=True, adaptive_percentile=0.45)
+        with wrap_strict(unit_test_model):
+            cache_strict = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_strict)
+
+        any_different = any(
+            not torch.equal(cache_default.layers[i].values, cache_strict.layers[i].values)
+            for i in range(len(cache_default.layers))
+        )
+        assert any_different, "adaptive_percentile=0.45 did not change merge results vs 0.25"
+
+    def test_adaptive_percentile_bounds(self):
+        with pytest.raises(AssertionError, match="adaptive_percentile"):
+            MergingPress(press=KnormPress(compression_ratio=0.5), adaptive_percentile=-0.1)
+        with pytest.raises(AssertionError, match="adaptive_percentile"):
+            MergingPress(press=KnormPress(compression_ratio=0.5), adaptive_percentile=0.6)
+
+    def test_score_weight_floor_changes_output(self, unit_test_model):  # noqa: F811
+        """Non-default score_weight_floor should change merge results."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_default = MergingPress(press=base1, score_weighting=True, score_weight_floor=0.5)
+        with wrap_default(unit_test_model):
+            cache_default = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_default)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_low = MergingPress(press=base2, score_weighting=True, score_weight_floor=0.1)
+        with wrap_low(unit_test_model):
+            cache_low = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_low)
+
+        any_different = any(
+            not torch.equal(cache_default.layers[i].values, cache_low.layers[i].values)
+            for i in range(len(cache_default.layers))
+        )
+        assert any_different, "score_weight_floor=0.1 did not change merge results vs 0.5"
+
+    def test_score_weight_floor_bounds(self):
+        with pytest.raises(AssertionError, match="score_weight_floor"):
+            MergingPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=-0.1)
+        with pytest.raises(AssertionError, match="score_weight_floor"):
+            MergingPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=1.1)
+
 
 class TestMergingAdaKVPress:
     def test_requires_scorer_press(self):
@@ -601,3 +655,15 @@ class TestMergingAdaKVPress:
             unit_test_model(input_ids, past_key_values=cache)
 
         assert len(wrapper.diagnostics) > 0, "No diagnostics collected"
+
+    def test_adaptive_percentile_bounds(self):
+        with pytest.raises(AssertionError, match="adaptive_percentile"):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), adaptive_percentile=-0.1)
+        with pytest.raises(AssertionError, match="adaptive_percentile"):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), adaptive_percentile=0.6)
+
+    def test_score_weight_floor_bounds(self):
+        with pytest.raises(AssertionError, match="score_weight_floor"):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=-0.1)
+        with pytest.raises(AssertionError, match="score_weight_floor"):
+            MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=1.1)

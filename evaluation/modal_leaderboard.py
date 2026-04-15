@@ -9,25 +9,22 @@ https://huggingface.co/spaces/nvidia/kvpress-leaderboard
 
 Usage:
     modal run evaluation/modal_leaderboard.py                              # all merging variants
-    modal run evaluation/modal_leaderboard.py --presses merging_vonorm_snapkv,merging_kvzap_mlp
+    modal run evaluation/modal_leaderboard.py --presses merging_snapkv,merging_kvzap_mlp
     modal run evaluation/modal_leaderboard.py --include-baselines          # also run unwrapped scorers
 """
 
 import json
-import pathlib
-
-import modal
 
 # ---------------------------------------------------------------------------
 # Modal image — needs enough VRAM for Qwen3-8B (~16 GB fp16, fits A100-40 GB)
 # ---------------------------------------------------------------------------
 import os
+import pathlib
 
-try:
-    hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
-except Exception:
-    _hf_token = os.environ.get("HF_TOKEN", "")
-    hf_secret = modal.Secret.from_dict({"HF_TOKEN": _hf_token}) if _hf_token else None
+import modal
+
+_hf_token = os.environ.get("HF_TOKEN", "")
+_secrets = [modal.Secret.from_dict({"HF_TOKEN": _hf_token})] if _hf_token else []
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -66,37 +63,27 @@ CRS = [0.25, 0.50, 0.75, 0.875]
 # Our MergingPress variants to submit
 MERGING_PRESSES = [
     # Core MergingPress wrapping different scorers
-    "merging_vonorm_knorm",
-    "merging_vonorm_snapkv",
+    "merging_knorm",
+    "merging_snapkv",
+    "merging_critical_snapkv",
     "merging_expected_attention",
-    "merging_tova",
-    "merging_observed_attention",
-    "merging_compactor",
-    # KVzap wrapping (the big orthogonality test)
     "merging_kvzap_mlp",
-    "merging_kvzap_linear",
     # MergingAdaKVPress
     "merging_adakv_snapkv",
-    "merging_adakv_expected_attention",
-    "merging_adakv_kvzap_mlp",
-    # Best config variants
-    "merging_score_snapkv",
-    "merging_adaptive_snapkv",
-    "merging_vonorm_critical_snapkv",
-    "merging_adakv_critical_snapkv",
+    # PrefillDecoding stacking: MergingPress + CAMPress
+    "merging_cam_knorm",
 ]
 
 # Baselines (the unwrapped scorers, for comparison)
 BASELINE_PRESSES = [
     "knorm",
     "snapkv",
-    "expected_attention",
-    "tova",
-    "observed_attention",
-    "compactor",
-    "adakv_snapkv",
-    "adakv_compactor",
     "critical_snapkv",
+    "expected_attention",
+    "fastkvzip",
+    "cam_knorm",
+    "cam_streaming_llm",
+    "adakv_snapkv",
 ]
 
 
@@ -115,7 +102,7 @@ def build_jobs(presses: list[str]) -> list[tuple[str, float]]:
     timeout=3600,
     memory=65536,
     scaledown_window=2,
-    secrets=[s for s in [hf_secret] if s is not None],
+    secrets=_secrets,
 )
 def run_one(press_name: str, cr: float) -> dict:
     """Run a single (variant, CR) leaderboard evaluation."""
@@ -191,7 +178,7 @@ def main(
     jobs = build_jobs(press_list)
 
     print(f"\n{'='*100}")
-    print(f"KVPress Leaderboard Evaluation — Modal A100")
+    print("KVPress Leaderboard Evaluation — Modal A100")
     print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR}")
     print(f"Presses: {len(press_list)} | Jobs: {len(jobs)} ({len(press_list)} × {len(CRS)} CRs + no_press)")
     print(f"{'='*100}\n")
@@ -251,21 +238,13 @@ def main(
     print(f"{'-'*70}")
 
     WRAP_MAP = {
-        "merging_vonorm_knorm": "knorm",
-        "merging_vonorm_snapkv": "snapkv",
+        "merging_knorm": "knorm",
+        "merging_snapkv": "snapkv",
+        "merging_critical_snapkv": "critical_snapkv",
         "merging_expected_attention": "expected_attention",
-        "merging_tova": "tova",
-        "merging_observed_attention": "observed_attention",
-        "merging_compactor": "compactor",
         "merging_kvzap_mlp": "kvzap_mlp",
-        "merging_kvzap_linear": "kvzap_linear",
         "merging_adakv_snapkv": "adakv_snapkv",
-        "merging_score_snapkv": "snapkv",
-        "merging_adaptive_snapkv": "snapkv",
-        "merging_vonorm_critical_snapkv": "critical_snapkv",
-        "merging_adakv_critical_snapkv": "critical_snapkv",
-        "merging_adakv_expected_attention": "expected_attention",
-        "merging_adakv_kvzap_mlp": "kvzap_mlp",
+        "merging_cam_knorm": "cam_knorm",
     }
 
     for merge_name in press_list:
@@ -278,10 +257,15 @@ def main(
             if m_label in table and b_label in table:
                 delta = table[m_label]["mean"] - table[b_label]["mean"]
                 sig = "+" if delta > 0 else ""
-                print(f"{merge_name:<35} {cr:>5.3f} {table[b_label]['mean']:>6.1f} {table[m_label]['mean']:>6.1f} {sig}{delta:>5.1f}")
+                b_mean = table[b_label]["mean"]
+                m_mean = table[m_label]["mean"]
+                print(
+                    f"{merge_name:<35} {cr:>5.3f}"
+                    f" {b_mean:>6.1f} {m_mean:>6.1f} {sig}{delta:>5.1f}"
+                )
 
     print(f"\n{'='*70}")
     print(f"Results saved to {output_dir}/")
-    print(f"To submit: fork huggingface.co/spaces/nvidia/kvpress-leaderboard")
+    print("To submit: fork huggingface.co/spaces/nvidia/kvpress-leaderboard")
     print(f"           copy {output_dir}/* into benchmark/ and create PR")
     print(f"{'='*70}")

@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from kvpress.presses.base_press import BasePress
@@ -28,6 +27,8 @@ def _merge_on_evict(
     collect_diagnostics: bool = False,
     score_weighting: bool = False,
     adaptive_threshold: bool = False,
+    adaptive_percentile: float = 0.25,
+    score_weight_floor: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Core merge-on-evict kernel shared by :class:`MergingPress` (prefill) and
@@ -76,10 +77,15 @@ def _merge_on_evict(
         target survivor than truly unimportant tokens.
     adaptive_threshold : bool, default=False
         When ``True``, the similarity threshold is computed dynamically as the
-        25th percentile of the per-token maximum cosine similarities instead
-        of using the fixed ``similarity_threshold``.  This skips the worst-
-        matched evicted tokens (bottom quartile) while still merging the
-        majority.
+        ``adaptive_percentile`` quantile of per-token maximum cosine
+        similarities instead of using the fixed ``similarity_threshold``.
+    adaptive_percentile : float, default=0.25
+        Quantile used when ``adaptive_threshold=True``.  Lower values are more
+        permissive (merge more tokens); higher values are stricter.
+    score_weight_floor : float, default=0.5
+        When ``score_weighting=True``, the minimum weight assigned to the
+        least-important evicted token.  The weight is linearly interpolated
+        between ``score_weight_floor`` and ``1.0``.
 
     Returns
     -------
@@ -121,14 +127,18 @@ def _merge_on_evict(
 
     # --- Threshold gate (adaptive or fixed) ---
     if adaptive_threshold:
-        threshold = torch.quantile(max_sim.float().flatten(-2), 0.25, dim=-1, keepdim=True).unsqueeze(-1)
+        threshold = torch.quantile(max_sim.float().flatten(-2), adaptive_percentile, dim=-1, keepdim=True).unsqueeze(-1)
         threshold = threshold.expand_as(max_sim)
         merge_mask = max_sim >= threshold
     else:
         merge_mask = max_sim >= similarity_threshold
     if not merge_mask.any():
         if collect_diagnostics:
-            return kept_keys.contiguous(), kept_values.contiguous(), {"n_merged": 0, "n_evicted": n_evict * bsz * num_kv_heads}
+            return (
+                kept_keys.contiguous(),
+                kept_values.contiguous(),
+                {"n_merged": 0, "n_evicted": n_evict * bsz * num_kv_heads},
+            )
         return kept_keys.contiguous(), kept_values.contiguous()
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -138,11 +148,12 @@ def _merge_on_evict(
         max_count = merge_count.max().item()
         mean_sim = max_sim[merge_mask].mean().item()
         logger.debug(
-            "merge_on_evict: %d/%d evicted tokens merged (%.1f%%), "
-            "mean_sim=%.3f, max_merges_per_survivor=%.0f",
-            n_merged, n_evict * bsz * num_kv_heads,
+            "merge_on_evict: %d/%d evicted tokens merged (%.1f%%), " "mean_sim=%.3f, max_merges_per_survivor=%.0f",
+            n_merged,
+            n_evict * bsz * num_kv_heads,
             100.0 * n_merged / (n_evict * bsz * num_kv_heads),
-            mean_sim, max_count,
+            mean_sim,
+            max_count,
         )
 
     # --- Similarity-weighted scatter-add merge ---
@@ -155,7 +166,7 @@ def _merge_on_evict(
         s_max = evict_scores.max(dim=-1, keepdim=True).values
         s_range = (s_max - s_min).clamp(min=_EPS)
         norm_scores = (evict_scores - s_min) / s_range  # 0 = least important, 1 = just missed keep
-        evict_w = evict_w * (0.5 + 0.5 * norm_scores)  # floor at 0.5 to avoid zeroing out
+        evict_w = evict_w * (score_weight_floor + (1.0 - score_weight_floor) * norm_scores)
 
     if value_norm_weighting:
         ev_vnorm = evict_values.float().norm(dim=-1)
@@ -264,6 +275,8 @@ class MergingPress(BasePress):
     max_merge_per_token: int = 0
     score_weighting: bool = False
     adaptive_threshold: bool = False
+    adaptive_percentile: float = 0.25
+    score_weight_floor: float = 0.5
     collect_diagnostics: bool = False
     diagnostics: list = field(default_factory=list, repr=False)
 
@@ -271,6 +284,8 @@ class MergingPress(BasePress):
         assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
+        assert 0.0 <= self.adaptive_percentile <= 0.5, "adaptive_percentile must be in [0.0, 0.5]"
+        assert 0.0 <= self.score_weight_floor <= 1.0, "score_weight_floor must be in [0.0, 1.0]"
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -305,8 +320,19 @@ class MergingPress(BasePress):
             return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
 
         result = _merge_on_evict(
-            keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token, self.collect_diagnostics, self.score_weighting, self.adaptive_threshold,
+            keys,
+            values,
+            scores,
+            n_kept,
+            self.similarity_threshold,
+            self.merge_keys,
+            self.value_norm_weighting,
+            self.max_merge_per_token,
+            self.collect_diagnostics,
+            self.score_weighting,
+            self.adaptive_threshold,
+            self.adaptive_percentile,
+            self.score_weight_floor,
         )
         if self.collect_diagnostics and len(result) == 3:
             merged_keys, merged_values, diag = result
@@ -361,6 +387,8 @@ class MergingDecodingPress(DecodingPress):
     max_merge_per_token: int = 0
     score_weighting: bool = False
     adaptive_threshold: bool = False
+    adaptive_percentile: float = 0.25
+    score_weight_floor: float = 0.5
 
     def compress(
         self,
@@ -386,8 +414,18 @@ class MergingDecodingPress(DecodingPress):
         self.base_press.compression_ratio = original_cr
 
         return _merge_on_evict(
-            keys, values, scores, n_kept, self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-            self.max_merge_per_token, score_weighting=self.score_weighting, adaptive_threshold=self.adaptive_threshold,
+            keys,
+            values,
+            scores,
+            n_kept,
+            self.similarity_threshold,
+            self.merge_keys,
+            self.value_norm_weighting,
+            self.max_merge_per_token,
+            score_weighting=self.score_weighting,
+            adaptive_threshold=self.adaptive_threshold,
+            adaptive_percentile=self.adaptive_percentile,
+            score_weight_floor=self.score_weight_floor,
         )
 
 
@@ -486,6 +524,8 @@ class MergingAdaKVPress(BasePress):
     max_merge_per_token: int = 0
     score_weighting: bool = False
     adaptive_threshold: bool = False
+    adaptive_percentile: float = 0.25
+    score_weight_floor: float = 0.5
     collect_diagnostics: bool = False
     diagnostics: list = field(default_factory=list, repr=False)
 
@@ -494,6 +534,8 @@ class MergingAdaKVPress(BasePress):
         assert 0.0 <= self.alpha_safeguard <= 1.0
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0
+        assert 0.0 <= self.adaptive_percentile <= 0.5, "adaptive_percentile must be in [0.0, 0.5]"
+        assert 0.0 <= self.score_weight_floor <= 1.0, "score_weight_floor must be in [0.0, 1.0]"
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -553,10 +595,19 @@ class MergingAdaKVPress(BasePress):
                 continue
 
             result = _merge_on_evict(
-                h_keys, h_values, h_scores, h_budget,
-                self.similarity_threshold, self.merge_keys, self.value_norm_weighting,
-                self.max_merge_per_token, self.collect_diagnostics, self.score_weighting,
+                h_keys,
+                h_values,
+                h_scores,
+                h_budget,
+                self.similarity_threshold,
+                self.merge_keys,
+                self.value_norm_weighting,
+                self.max_merge_per_token,
+                self.collect_diagnostics,
+                self.score_weighting,
                 self.adaptive_threshold,
+                self.adaptive_percentile,
+                self.score_weight_floor,
             )
             if self.collect_diagnostics and len(result) == 3:
                 mk, mv, diag = result

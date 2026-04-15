@@ -94,6 +94,9 @@ def _merge_on_evict(
 
     # --- Partition into keep / evict ---
     keep_idx = scores.topk(n_kept, dim=-1).indices  # (B, H, n_kept)
+
+    # nonzero() returns indices in row-major (C-contiguous) order, so the
+    # reshape below produces a correct (B, H, n_evict) partition.
     mask = torch.ones(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
     mask.scatter_(2, keep_idx, False)
     evict_idx = mask.nonzero(as_tuple=False)[:, 2].reshape(bsz, num_key_value_heads, n_evict)
@@ -102,15 +105,19 @@ def _merge_on_evict(
     idx4 = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
     kept_keys = keys.gather(2, idx4)
     kept_values = values.gather(2, idx4)
+
     idx4_e = evict_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
     evict_keys = keys.gather(2, idx4_e)
     evict_values = values.gather(2, idx4_e)
 
-    # --- Cosine similarity → nearest survivor ---
+    # --- Batched cosine similarity → nearest survivor ---
+    # Guard against zero-norm keys: clamp norms to avoid NaN from F.normalize
     evict_keys_f = evict_keys.float()
     kept_keys_f = kept_keys.float()
-    e_norm = evict_keys_f / evict_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
-    s_norm = kept_keys_f / kept_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+    e_norms = evict_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+    s_norms = kept_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+    e_norm = evict_keys_f / e_norms
+    s_norm = kept_keys_f / s_norms
     sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))  # (B, H, n_evict, n_kept)
     max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
@@ -126,8 +133,7 @@ def _merge_on_evict(
         max_count = merge_count.max().item()
         mean_sim = max_sim[merge_mask].mean().item()
         logger.debug(
-            "merge_on_evict: %d/%d evicted tokens merged (%.1f%%), "
-            "mean_sim=%.3f, max_merges_per_survivor=%.0f",
+            "merge_on_evict: %d/%d evicted tokens merged (%.1f%%), " "mean_sim=%.3f, max_merges_per_survivor=%.0f",
             n_merged,
             n_evict * bsz * num_key_value_heads,
             100.0 * n_merged / (n_evict * bsz * num_key_value_heads),
@@ -151,18 +157,21 @@ def _merge_on_evict(
         excess = (merge_count / max_merge_per_token).clamp(min=1.0)
         evict_w = evict_w / excess.gather(2, target_idx)
 
-    ew = evict_w.unsqueeze(-1)
-    tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)
+    ew = evict_w.unsqueeze(-1)  # (B, H, n_evict, 1)
+    tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)  # (B, H, n_evict, D)
 
+    # Accumulate in float32 for numerical stability
     val_accum = torch.zeros(bsz, num_key_value_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
     val_accum.scatter_add_(2, tgt, ew * evict_values.float())
+
     w_accum = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
     w_accum.scatter_add_(2, target_idx, evict_w)
 
-    # --- Normalize ---
+    # --- Normalize: weighted average for active positions ---
     active = w_accum > 0
     total_w = (1.0 + w_accum).unsqueeze(-1)
     active_mask = active.unsqueeze(-1)
+
     new_vals = (kept_values.float() + val_accum) / total_w
     merged_values = torch.where(active_mask, new_vals.to(kept_values.dtype), kept_values)
 
@@ -179,7 +188,43 @@ def _merge_on_evict(
 
 @dataclass
 class MergingPress(BasePress):
-    """Scorer-agnostic merge-on-evict wrapper for KV cache compression during prefill."""
+    """
+    Scorer-agnostic merge-on-evict wrapper for KV cache compression during prefill.
+
+    Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
+    each evicted token is folded into its most similar surviving neighbor rather than
+    being discarded.  Values are blended via a similarity-weighted average; keys can
+    optionally be merged or left unchanged depending on the ``merge_keys`` flag.
+
+    The scoring is delegated entirely to the wrapped press; only the eviction step
+    changes.  This makes the wrapper composable with all existing scorers.
+
+
+    Parameters
+    ----------
+    press : ScorerPress
+        The underlying scoring method whose scores determine which tokens survive.
+    similarity_threshold : float, default=0.0
+        Minimum cosine similarity between an evicted key and its nearest survivor
+        for the merge to proceed.  Evicted tokens below this threshold are dropped
+        without merging.  Because cosine similarity can be negative, ``threshold=0.0``
+        still drops tokens whose keys point in the opposite direction of all survivors.
+    merge_keys : bool, default=False
+        Whether to merge evicted information into kept keys.  When ``False`` (default),
+        only values are merged — kept keys are returned unchanged.  This preserves
+        RoPE positional encoding in the keys.  Empirically, ``merge_keys=True`` hurts
+        quality on RoPE models (−2.5 pp on RULER-4096 with Qwen3-8B at CR=0.75).
+    value_norm_weighting : bool, default=True
+        When ``True`` (default), the merge weight for each evicted token is additionally
+        scaled by the relative L2 norm of its value vector.  This allocates more merge
+        budget to evicted tokens that carry high-magnitude value content.  Empirically,
+        this improves accuracy by ~1.9 pp on RULER-4096.
+    max_merge_per_token : int, default=0
+        Maximum number of evicted tokens merged into any single survivor before
+        weight scaling kicks in.  ``0`` (default) disables the cap.  When set,
+        survivors that receive more merges than the cap have each inbound weight
+        scaled down proportionally, preventing dilution of high-importance tokens.
+    """
 
     press: ScorerPress
     similarity_threshold: float = 0.0

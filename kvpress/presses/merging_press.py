@@ -3,8 +3,13 @@
 
 
 import logging
+from dataclasses import dataclass
 
 import torch
+from torch import nn
+
+from kvpress.presses.base_press import BasePress
+from kvpress.presses.scorer_press import ScorerPress
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +22,9 @@ def _merge_on_evict(
     values: torch.Tensor,
     scores: torch.Tensor,
     n_kept: int,
-    similarity_threshold: float = 0.0,
-    merge_keys: bool = False,
-    value_norm_weighting: bool = True,
+    similarity_threshold: float,
+    merge_keys: bool,
+    value_norm_weighting: bool,
     max_merge_per_token: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -170,3 +175,62 @@ def _merge_on_evict(
         merged_keys = kept_keys
 
     return merged_keys.contiguous(), merged_values.contiguous()
+
+
+@dataclass
+class MergingPress(BasePress):
+    """Scorer-agnostic merge-on-evict wrapper for KV cache compression during prefill."""
+
+    press: ScorerPress
+    similarity_threshold: float = 0.0
+    merge_keys: bool = False
+    value_norm_weighting: bool = True
+    max_merge_per_token: int = 0
+
+    def __post_init__(self):
+        assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
+        assert 0.0 <= self.similarity_threshold <= 1.0
+        assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
+
+    def post_init_from_model(self, model):
+        self.press.post_init_from_model(model)
+
+    @property
+    def compression_ratio(self):
+        return self.press.compression_ratio
+
+    @compression_ratio.setter
+    def compression_ratio(self, value):
+        self.press.compression_ratio = value
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.press.compression_ratio == 0:
+            return keys, values
+
+        bsz, num_key_value_heads, k_len, head_dim = keys.shape
+        scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
+
+        n_kept = int(k_len * (1 - self.press.compression_ratio))
+        if n_kept >= k_len:
+            return keys, values
+        if n_kept <= 0:
+            return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
+
+        return _merge_on_evict(
+            keys,
+            values,
+            scores,
+            n_kept,
+            self.similarity_threshold,
+            self.merge_keys,
+            self.value_norm_weighting,
+            self.max_merge_per_token,
+        )

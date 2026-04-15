@@ -1,0 +1,406 @@
+{
+  "config": {
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "dataset": "ruler",
+    "data_dir": "4096",
+    "fraction": 0.1,
+    "seed": 42,
+    "crs": [
+      0.25,
+      0.5,
+      0.75,
+      0.875
+    ],
+    "variants": [
+      "knorm",
+      "snapkv",
+      "critical_snapkv",
+      "adakv_snapkv",
+      "merging_vonorm_knorm",
+      "merging_vonorm_snapkv",
+      "merging_vonorm_critical_snapkv",
+      "merging_score_knorm",
+      "merging_score_snapkv",
+      "merging_score_critical_snapkv",
+      "merging_simonly_knorm",
+      "merging_simonly_snapkv",
+      "merging_adaptive_knorm",
+      "merging_adaptive_snapkv",
+      "merging_adakv_knorm",
+      "merging_adakv_snapkv",
+      "merging_adakv_snapkv_score",
+      "merging_adakv_critical_snapkv"
+    ]
+  },
+  "table": {},
+  "paired_vs_baseline": [],
+  "head_to_head_vonorm_vs_score": [],
+  "head_to_head_adakv_vs_merging_adakv": [],
+  "errors": [
+    {
+      "variant": "no_press",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debbb3-6d1281a6619fdd3d7ef360d1;372ddc48-c9ab-4f23-9a7a-71d08d6bb9c4)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "knorm",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debbb2-3b8adcef32fffee2511b09a0;a20178b8-359e-4f9a-9397-eda08a9853a0)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "knorm",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debbb8-082a71d15c7130c940f7cb89;c73c0e59-5bcd-47bc-ba17-f2506d14d672)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "knorm",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debbbc-69e8eeb41dd1e166407ace94;3d6b5f0c-b9fe-411d-85e5-123cd25e43ac)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "knorm",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9c-305437d4232f57064a51b394;d729c49f-d5ef-4cad-91cf-1ae0f52af74c)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "snapkv",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9d-4d7d84620da85f3b04db4c87;62af0ca4-e564-41b9-afb1-dcd5af25fc2f)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "snapkv",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9d-617564d22ef426837bba14ff;05c54df7-5151-4756-b7d3-5b97fd251c11)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "snapkv",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debba4-5ac26a626c12e9105ee36b7b;c13cee12-0030-4ded-b6dd-c0051f4c2f70)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "snapkv",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debba1-1883c9d511f206c76237a359;5408fd8f-ec25-4fd5-8fe8-00a711715d14)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "critical_snapkv",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9c-62a7c18a0030790a2cad7e08;b7eb02fc-7757-4cf6-8112-2251883cfd7b)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "critical_snapkv",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9c-5cd419c4158260e8506a0b8b;6f3c62fb-6d7b-41a9-b267-561e8691a065)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "critical_snapkv",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9d-67bc60d9053481461ae8ef8d;9b46e0b8-ec6c-4e37-8c78-08042f7b8522)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "critical_snapkv",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9d-43be5d2d189309df14bf5438;de42f0de-0ade-40b2-9a24-5ecc6f19b282)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "adakv_snapkv",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9d-03d5a6a677d354a974dae010;b437efd0-d54a-4ac7-ba8c-9b008a945c87)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "adakv_snapkv",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-1d9015ae4b6181d578976572;267cac7e-267a-4860-8a22-975a09527cc4)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "adakv_snapkv",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-39507bd06cf285ac0246c04e;31c487b9-ad78-4f51-8ba1-73a0dad086d6)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "adakv_snapkv",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-3103943f4af19d0e54888bbc;5113419d-4884-4d76-baa3-3ea4d96b6e31)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_knorm",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-777ce00e23fe824728e4d6c7;57494822-6c04-4ada-b096-5677a8a0f192)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_knorm",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-1f48926a7b2b32f3206cee36;0627bed1-f98f-4b4a-9c90-1be6da8ce3bd)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_knorm",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-475f005e091be2ee475822fd;0a386669-4391-4f97-bcf9-396e440b9d59)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_knorm",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-5b066d022e5b037c4908eac7;8a53f9a9-677c-4c99-8a80-ae8d96fdf41c)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_snapkv",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-2f171c8e4c9711364c52fd54;7313aeba-e749-476f-9594-3891b4a5e22a)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_snapkv",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9e-0b2078377ec8c9f01819295e;5e9f1355-3544-4d7a-93d8-e936383e6a0d)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_snapkv",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-3cb21a3b0cc5a35d02fcfd60;423f11dc-00e4-40a9-89fb-41fed4c97af3)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_snapkv",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-53a50eb94ba8a4a0698fabec;eece9c8d-6d68-48a9-9661-e154d43b9b52)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_critical_snapkv",
+      "compression_ratio": 0.25,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-58d633f903c6cd2b4ca1c5ea;928a8946-8207-4da7-8051-e404eb328b13)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_critical_snapkv",
+      "compression_ratio": 0.5,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-5a137fca0c7c85d46d95040f;4ec6ec88-0321-46d1-9d34-9aa55755075d)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_critical_snapkv",
+      "compression_ratio": 0.75,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-394fbc70554475a64a246796;59f0e5a9-d484-4ad5-92ee-50402cdc0bd5)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_vonorm_critical_snapkv",
+      "compression_ratio": 0.875,
+      "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct.\n401 Client Error. (Request ID: Root=1-69debb9f-4d8ab3ff5c78b7c93a225df9;9f11301b-2650-4274-b59b-736980d31110)\n\nCannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main/config.json.\nAccess to model meta-llama/Llama-3.2-1B-Instruct is restricted. You must have access to it and be authenticated to access it. Please log in."
+    },
+    {
+      "variant": "merging_score_knorm",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_score_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_knorm",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_score_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_knorm",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_score_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_knorm",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_score_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_score_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_score_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_score_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_score_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_critical_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_score_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_critical_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_score_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_critical_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_score_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_score_critical_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_score_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_knorm",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_simonly_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_knorm",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_simonly_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_knorm",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_simonly_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_knorm",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_simonly_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_simonly_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_simonly_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_simonly_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_simonly_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_simonly_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_knorm",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adaptive_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_knorm",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adaptive_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_knorm",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adaptive_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_knorm",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adaptive_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adaptive_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adaptive_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adaptive_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adaptive_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adaptive_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_knorm",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adakv_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_knorm",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adakv_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_knorm",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adakv_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_knorm",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adakv_knorm' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adakv_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adakv_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adakv_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adakv_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv_score",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adakv_snapkv_score' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv_score",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adakv_snapkv_score' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv_score",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adakv_snapkv_score' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_snapkv_score",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adakv_snapkv_score' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_critical_snapkv",
+      "compression_ratio": 0.25,
+      "error": "Press 'merging_adakv_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_critical_snapkv",
+      "compression_ratio": 0.5,
+      "error": "Press 'merging_adakv_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_critical_snapkv",
+      "compression_ratio": 0.75,
+      "error": "Press 'merging_adakv_critical_snapkv' not found in PRESS_REGISTRY"
+    },
+    {
+      "variant": "merging_adakv_critical_snapkv",
+      "compression_ratio": 0.875,
+      "error": "Press 'merging_adakv_critical_snapkv' not found in PRESS_REGISTRY"
+    }
+  ]
+}

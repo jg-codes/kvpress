@@ -1,0 +1,120 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-8B",
+    "dataset": "ruler",
+    "data_dir": "4096",
+    "compression_ratio": 0.75,
+    "fraction": 0.03,
+    "seed": 42,
+    "num_samples": 195,
+    "platform": "Modal (NVIDIA L4 GPU)",
+    "date": "2026-04-12",
+    "note": "Fair A/B comparison: all variants evaluated on identical 195-sample subsample (seed=42)"
+  },
+  "results": [
+    {
+      "press_name": "snapkv",
+      "label": "Plain SnapKV (no merge)",
+      "average": 31.02,
+      "metrics": {
+        "cwe": {"string_match": 96.67},
+        "fwe": {"string_match": 85.71},
+        "niah_multikey_1": {"string_match": 0.0},
+        "niah_multikey_2": {"string_match": 0.0},
+        "niah_multikey_3": {"string_match": 0.0},
+        "niah_multiquery": {"string_match": 11.67},
+        "niah_multivalue": {"string_match": 3.33},
+        "niah_single_1": {"string_match": 60.0},
+        "niah_single_2": {"string_match": 13.64},
+        "niah_single_3": {"string_match": 5.56},
+        "qa_1": {"string_match": 66.67},
+        "qa_2": {"string_match": 33.33},
+        "vt": {"string_match": 26.67}
+      }
+    },
+    {
+      "press_name": "merging_snapkv",
+      "label": "MergingPress(SnapKV) merge_keys=True",
+      "average": 28.52,
+      "metrics": {
+        "cwe": {"string_match": 90.83},
+        "fwe": {"string_match": 83.33},
+        "niah_multikey_1": {"string_match": 0.0},
+        "niah_multikey_2": {"string_match": 0.0},
+        "niah_multikey_3": {"string_match": 0.0},
+        "niah_multiquery": {"string_match": 8.33},
+        "niah_multivalue": {"string_match": 0.0},
+        "niah_single_1": {"string_match": 70.0},
+        "niah_single_2": {"string_match": 22.73},
+        "niah_single_3": {"string_match": 0.0},
+        "qa_1": {"string_match": 53.33},
+        "qa_2": {"string_match": 22.22},
+        "vt": {"string_match": 20.0}
+      }
+    },
+    {
+      "press_name": "merging_vonorm_snapkv",
+      "label": "MergingPress(SnapKV) merge_keys=False, value_norm_weighting=True",
+      "average": 32.89,
+      "metrics": {
+        "cwe": {"string_match": 94.17},
+        "fwe": {"string_match": 88.1},
+        "niah_multikey_1": {"string_match": 0.0},
+        "niah_multikey_2": {"string_match": 0.0},
+        "niah_multikey_3": {"string_match": 0.0},
+        "niah_multiquery": {"string_match": 11.67},
+        "niah_multivalue": {"string_match": 3.33},
+        "niah_single_1": {"string_match": 70.0},
+        "niah_single_2": {"string_match": 13.64},
+        "niah_single_3": {"string_match": 5.56},
+        "qa_1": {"string_match": 66.67},
+        "qa_2": {"string_match": 27.78},
+        "vt": {"string_match": 46.67}
+      }
+    },
+    {
+      "press_name": "expected_attention_plain",
+      "label": "Plain ExpectedAttention (no merge)",
+      "average": 21.52,
+      "metrics": {
+        "cwe": {"string_match": 39.17},
+        "fwe": {"string_match": 83.33},
+        "niah_multikey_1": {"string_match": 0.0},
+        "niah_multikey_2": {"string_match": 0.0},
+        "niah_multikey_3": {"string_match": 0.0},
+        "niah_multiquery": {"string_match": 0.0},
+        "niah_multivalue": {"string_match": 1.67},
+        "niah_single_1": {"string_match": 40.0},
+        "niah_single_2": {"string_match": 0.0},
+        "niah_single_3": {"string_match": 0.0},
+        "qa_1": {"string_match": 60.0},
+        "qa_2": {"string_match": 33.33},
+        "vt": {"string_match": 22.22}
+      }
+    },
+    {
+      "press_name": "merging_expected_attention",
+      "label": "MergingPress(ExpectedAttention) merge_keys=True",
+      "average": null,
+      "note": "Partial results only - OOM on container reuse",
+      "partial_metrics": {
+        "cwe": {"string_match": 59.17},
+        "fwe": {"string_match": 83.33},
+        "niah_multikey_1": {"string_match": 6.67}
+      }
+    }
+  ],
+  "analysis": {
+    "hypothesis_confirmed": "merge_keys=True (RoPE contamination) hurts performance: 28.52 vs 31.02 baseline (-2.50 pts)",
+    "best_variant": "merging_vonorm_snapkv (merge_keys=False, value_norm_weighting=True): 32.89 avg (+1.87 over baseline)",
+    "key_improvements": {
+      "vt": "+20.0 (26.67 -> 46.67)",
+      "niah_single_1": "+10.0 (60.0 -> 70.0)",
+      "fwe": "+2.4 (85.71 -> 88.10)"
+    },
+    "key_regressions": {
+      "qa_2": "-5.5 (33.33 -> 27.78)",
+      "cwe": "-2.5 (96.67 -> 94.17)"
+    }
+  }
+}

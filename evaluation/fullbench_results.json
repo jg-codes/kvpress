@@ -1,0 +1,28 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-8B",
+    "dataset": "ruler",
+    "data_dir": "4096",
+    "compression_ratio": 0.75,
+    "fraction": 1.0,
+    "seed": 42
+  },
+  "results": [
+    {
+      "error": "Task's current input in-01KP20NBVE9Y0VTT284F9NCN6D:1776036786032-0 hit its timeout of 7200s",
+      "variant": "snapkv"
+    },
+    {
+      "error": "Task's current input in-01KP20NC11T7964GWMNPCGPFJG:1776036786214-0 hit its timeout of 7200s",
+      "variant": "merging_vonorm_snapkv"
+    },
+    {
+      "error": "Task's current input in-01KP20NC117D2YHHZGPMQ0X3AH:1776036786214-1 hit its timeout of 7200s",
+      "variant": "critical_snapkv"
+    },
+    {
+      "error": "Press 'merging_vonorm_critical_snapkv' not found in PRESS_REGISTRY",
+      "variant": "merging_vonorm_critical_snapkv"
+    }
+  ]
+}

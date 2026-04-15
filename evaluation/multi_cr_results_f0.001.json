@@ -1,0 +1,368 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-8B",
+    "dataset": "ruler",
+    "data_dir": "4096",
+    "fraction": 0.001,
+    "seed": 42,
+    "crs": [
+      0.25,
+      0.5,
+      0.75,
+      0.875
+    ]
+  },
+  "table": {
+    "no_press": {
+      "press_name": "no_press",
+      "cr": 0.75,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "knorm (cr=0.25)": {
+      "press_name": "knorm",
+      "cr": 0.25,
+      "mean": 100.0,
+      "ci_lo": 100.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 100.0
+      }
+    },
+    "knorm (cr=0.50)": {
+      "press_name": "knorm",
+      "cr": 0.5,
+      "mean": 71.88,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 87.5,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "knorm (cr=0.75)": {
+      "press_name": "knorm",
+      "cr": 0.75,
+      "mean": 59.38,
+      "ci_lo": 18.75,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 37.5,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "knorm (cr=0.88)": {
+      "press_name": "knorm",
+      "cr": 0.875,
+      "mean": 15.62,
+      "ci_lo": 0.0,
+      "ci_hi": 37.5,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 50.0,
+        "qa_1": 0.0
+      }
+    },
+    "snapkv (cr=0.25)": {
+      "press_name": "snapkv",
+      "cr": 0.25,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "snapkv (cr=0.50)": {
+      "press_name": "snapkv",
+      "cr": 0.5,
+      "mean": 87.5,
+      "ci_lo": 62.5,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 50.0,
+        "niah_single_2": 100.0,
+        "qa_1": 100.0
+      }
+    },
+    "snapkv (cr=0.75)": {
+      "press_name": "snapkv",
+      "cr": 0.75,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 0.0,
+        "qa_1": 100.0
+      }
+    },
+    "snapkv (cr=0.88)": {
+      "press_name": "snapkv",
+      "cr": 0.875,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 0.0,
+        "qa_1": 100.0
+      }
+    },
+    "critical_snapkv (cr=0.25)": {
+      "press_name": "critical_snapkv",
+      "cr": 0.25,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "critical_snapkv (cr=0.50)": {
+      "press_name": "critical_snapkv",
+      "cr": 0.5,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "critical_snapkv (cr=0.75)": {
+      "press_name": "critical_snapkv",
+      "cr": 0.75,
+      "mean": 31.25,
+      "ci_lo": 0.0,
+      "ci_hi": 62.5,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 75.0,
+        "niah_single_2": 50.0,
+        "qa_1": 0.0
+      }
+    },
+    "critical_snapkv (cr=0.88)": {
+      "press_name": "critical_snapkv",
+      "cr": 0.875,
+      "mean": 6.25,
+      "ci_lo": 0.0,
+      "ci_hi": 18.75,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 25.0,
+        "niah_single_2": 0.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_knorm (cr=0.25)": {
+      "press_name": "merging_vonorm_knorm",
+      "cr": 0.25,
+      "mean": 100.0,
+      "ci_lo": 100.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 100.0
+      }
+    },
+    "merging_vonorm_knorm (cr=0.50)": {
+      "press_name": "merging_vonorm_knorm",
+      "cr": 0.5,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_knorm (cr=0.75)": {
+      "press_name": "merging_vonorm_knorm",
+      "cr": 0.75,
+      "mean": 56.25,
+      "ci_lo": 12.5,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 25.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_knorm (cr=0.88)": {
+      "press_name": "merging_vonorm_knorm",
+      "cr": 0.875,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_snapkv (cr=0.25)": {
+      "press_name": "merging_vonorm_snapkv",
+      "cr": 0.25,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_snapkv (cr=0.50)": {
+      "press_name": "merging_vonorm_snapkv",
+      "cr": 0.5,
+      "mean": 93.75,
+      "ci_lo": 81.25,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 75.0,
+        "niah_single_2": 100.0,
+        "qa_1": 100.0
+      }
+    },
+    "merging_vonorm_snapkv (cr=0.75)": {
+      "press_name": "merging_vonorm_snapkv",
+      "cr": 0.75,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 0.0,
+        "qa_1": 100.0
+      }
+    },
+    "merging_vonorm_snapkv (cr=0.88)": {
+      "press_name": "merging_vonorm_snapkv",
+      "cr": 0.875,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 0.0,
+        "qa_1": 100.0
+      }
+    },
+    "merging_vonorm_critical_snapkv (cr=0.25)": {
+      "press_name": "merging_vonorm_critical_snapkv",
+      "cr": 0.25,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_critical_snapkv (cr=0.50)": {
+      "press_name": "merging_vonorm_critical_snapkv",
+      "cr": 0.5,
+      "mean": 75.0,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 100.0,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_critical_snapkv (cr=0.75)": {
+      "press_name": "merging_vonorm_critical_snapkv",
+      "cr": 0.75,
+      "mean": 71.88,
+      "ci_lo": 25.0,
+      "ci_hi": 100.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 100.0,
+        "niah_multiquery": 87.5,
+        "niah_single_2": 100.0,
+        "qa_1": 0.0
+      }
+    },
+    "merging_vonorm_critical_snapkv (cr=0.88)": {
+      "press_name": "merging_vonorm_critical_snapkv",
+      "cr": 0.875,
+      "mean": 28.12,
+      "ci_lo": 0.0,
+      "ci_hi": 75.0,
+      "n_tasks": 4,
+      "per_task": {
+        "niah_multikey_3": 0.0,
+        "niah_multiquery": 12.5,
+        "niah_single_2": 0.0,
+        "qa_1": 100.0
+      }
+    }
+  },
+  "errors": []
+}

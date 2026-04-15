@@ -27,6 +27,7 @@ from kvpress import (
     DuoAttentionPress,
     FinchPress,
     ObservedAttentionPress,
+    PrefillDecodingPress,
     ScorerPress,
     ThinKPress,
 )
@@ -289,6 +290,17 @@ class EvaluationRunner:
             logger.info(
                 f"Set DecodingPress compression_interval to {self.config.compression_interval}, target_size to {self.config.target_size}, hidden_states_buffer_size to {self.config.hidden_states_buffer_size}"
             )
+        elif isinstance(press, PrefillDecodingPress):
+            # Set CR on the prefilling press; decoding press uses its own target_size
+            if press.prefilling_press is not None and hasattr(press.prefilling_press, "compression_ratio"):
+                press.prefilling_press.compression_ratio = compression_ratio
+                logger.info(f"Set PrefillDecodingPress prefilling CR to {compression_ratio}")
+            if press.decoding_press is not None:
+                press.decoding_press.compression_interval = (
+                    self.config.compression_interval or press.decoding_press.compression_interval
+                )
+                press.decoding_press.target_size = self.config.target_size or press.decoding_press.target_size
+                logger.info(f"Set PrefillDecodingPress decoding target_size to {press.decoding_press.target_size}")
         else:
             if hasattr(press, "compression_ratio"):
                 press.compression_ratio = compression_ratio
@@ -447,7 +459,9 @@ class EvaluationRunner:
                 self.df.loc[df_group.index, "predicted_answer"] = output["answers"]  # type: ignore[union-attr]
                 # Store the actual compression ratio used (if the press has one)
                 self.df.loc[df_group.index, "compression_ratio"] = (
-                    self.press.compression_ratio if self.press is not None else 0.0  # type: ignore[attr-defined]
+                    getattr(self.press, "compression_ratio", self.config.compression_ratio)
+                    if self.press is not None
+                    else 0.0
                 )  # type: ignore[union-attr, attr-defined]
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
 

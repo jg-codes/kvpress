@@ -282,7 +282,14 @@ def run_speed(press_name: str, cr: float) -> dict:
 
         # Approximate: prefill is bulk of first-token time, gen is the rest
         # We measure total and tokens/sec for now
-        gen_tokens = len(tokenizer.encode(output[0]["generated_text"]))
+        # Pipeline output can be [{"generated_text": ...}] or {"generated_text": ...}
+        if isinstance(output, list):
+            gen_text = output[0]["generated_text"]
+        elif isinstance(output, dict):
+            gen_text = output["generated_text"]
+        else:
+            gen_text = str(output)
+        gen_tokens = len(tokenizer.encode(gen_text))
         prefill_times.append(total)  # total includes both
         gen_times.append(gen_tokens)
         peak_mems.append(peak_mem)

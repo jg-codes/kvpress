@@ -3,7 +3,8 @@
 
 import pytest
 import torch
-from transformers import DynamicCache
+from transformers import DynamicCache, QuantizedCache
+from transformers.utils import is_optimum_quanto_available
 
 from kvpress import KnormPress, SnapKVPress
 from kvpress.presses.merging_press import MergingPress
@@ -204,3 +205,118 @@ class TestMergingPress:
                 break
         assert any_different, "value_norm_weighting did not change merge results"
 
+    def test_merge_preserves_more_info_than_hard_eviction(self, unit_test_model):  # noqa: F811
+        """Merge-on-evict should stay closer to the uncompressed cache than hard eviction."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        cache_ref = DynamicCache()
+        unit_test_model(input_ids.clone(), past_key_values=cache_ref)
+        ref_values = [layer.values.float() for layer in cache_ref.layers]
+
+        base_hard = KnormPress(compression_ratio=0.7)
+        with base_hard(unit_test_model):
+            cache_hard = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_hard)
+
+        base_merge = KnormPress(compression_ratio=0.7)
+        wrapper = MergingPress(press=base_merge, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        def value_reconstruction_error(compressed_cache):
+            total = 0.0
+            for i, layer in enumerate(compressed_cache.layers):
+                n = layer.values.shape[2]
+                total += (layer.values.float() - ref_values[i][:, :, :n]).norm().item()
+            return total
+
+        err_hard = value_reconstruction_error(cache_hard)
+        err_merge = value_reconstruction_error(cache_merge)
+
+        assert err_merge <= err_hard + 1e-6, f"Merge error ({err_merge:.4f}) > hard eviction error ({err_hard:.4f})"
+
+    def test_batch_size_greater_than_one(self, unit_test_model):  # noqa: F811
+        """The nonzero().reshape() partition must work correctly for batch_size > 1."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (2, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        assert cache.get_seq_length() == 32
+        for layer in cache.layers:
+            assert layer.keys.shape[0] == 2, "Batch dimension lost"
+            assert torch.isfinite(layer.keys).all()
+            assert torch.isfinite(layer.values).all()
+
+    def test_max_merge_per_token_validation(self):
+        with pytest.raises(AssertionError, match="non-negative"):
+            MergingPress(press=KnormPress(compression_ratio=0.5), max_merge_per_token=-1)
+
+    def test_max_merge_per_token_changes_output(self, unit_test_model):  # noqa: F811
+        """Capping merges per survivor should produce different values than uncapped."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_uncapped = MergingPress(press=base1, similarity_threshold=0.0, max_merge_per_token=0)
+        with wrap_uncapped(unit_test_model):
+            cache_uncapped = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_uncapped)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_capped = MergingPress(press=base2, similarity_threshold=0.0, max_merge_per_token=1)
+        with wrap_capped(unit_test_model):
+            cache_capped = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_capped)
+
+        any_different = False
+        for i in range(len(cache_uncapped.layers)):
+            if not torch.equal(cache_uncapped.layers[i].values, cache_capped.layers[i].values):
+                any_different = True
+                break
+        assert any_different, "max_merge_per_token=1 should differ from uncapped"
+
+    def test_high_compression_short_sequence(self, unit_test_model):  # noqa: F811
+        """Very high compression on a short sequence must not crash."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 8), device=unit_test_model.device)
+        base = KnormPress(compression_ratio=0.9)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        input_ids2 = torch.randint(0, 1024, (1, 16), device=unit_test_model.device)
+        base2 = KnormPress(compression_ratio=0.9)
+        wrapper2 = MergingPress(press=base2, similarity_threshold=0.0)
+        with wrapper2(unit_test_model):
+            cache2 = DynamicCache()
+            unit_test_model(input_ids2, past_key_values=cache2)
+        seq_len = cache2.get_seq_length()
+        assert seq_len >= 1, f"Cache is empty after high compression on 16 tokens: {seq_len}"
+        for layer in cache2.layers:
+            assert torch.isfinite(layer.keys).all()
+            assert torch.isfinite(layer.values).all()
+
+    @pytest.mark.skipif(not is_optimum_quanto_available(), reason="Optimum Quanto is not available")
+    def test_quantized_cache_compatibility(self, unit_test_model):  # noqa: F811
+        """MergingPress should work with QuantizedCache (dequant → merge → requant)."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        cache = QuantizedCache(backend="quanto", config=unit_test_model.config, nbits=4)
+        with wrapper(unit_test_model):
+            unit_test_model(input_ids, past_key_values=cache)
+
+        assert cache.get_seq_length() == 32
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), "Non-finite keys with QuantizedCache"
+            assert torch.isfinite(layer.values).all(), "Non-finite values with QuantizedCache"

@@ -17,6 +17,10 @@ def _merge_on_evict(
     values: torch.Tensor,
     scores: torch.Tensor,
     n_kept: int,
+    similarity_threshold: float = 0.0,
+    merge_keys: bool = False,
+    value_norm_weighting: bool = True,
+    max_merge_per_token: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Core merge-on-evict: partition by score, fold evicted tokens into nearest survivor."""
     bsz, num_key_value_heads, k_len, head_dim = keys.shape
@@ -44,8 +48,27 @@ def _merge_on_evict(
     sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))  # (B, H, n_evict, n_kept)
     max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
-    # --- Uniform-weight scatter-add merge ---
-    evict_w = max_sim.clamp(min=0)
+    # --- Threshold gate ---
+    merge_mask = max_sim >= similarity_threshold
+    if not merge_mask.any():
+        return kept_keys.contiguous(), kept_values.contiguous()
+
+    # --- Similarity-weighted scatter-add merge ---
+    evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
+
+    if value_norm_weighting:
+        ev_vnorm = evict_values.float().norm(dim=-1)
+        target_vnorm = kept_values.float().norm(dim=-1).gather(2, target_idx)
+        rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + _EPS)
+        evict_w = evict_w * rel_norm
+
+    # --- Merge count cap: prevent survivor dilution ---
+    if max_merge_per_token > 0:
+        merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
+        merge_count.scatter_add_(2, target_idx, merge_mask.float())
+        excess = (merge_count / max_merge_per_token).clamp(min=1.0)
+        evict_w = evict_w / excess.gather(2, target_idx)
+
     ew = evict_w.unsqueeze(-1)
     tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)
 
@@ -57,7 +80,16 @@ def _merge_on_evict(
     # --- Normalize ---
     active = w_accum > 0
     total_w = (1.0 + w_accum).unsqueeze(-1)
+    active_mask = active.unsqueeze(-1)
     new_vals = (kept_values.float() + val_accum) / total_w
-    merged_values = torch.where(active.unsqueeze(-1), new_vals.to(kept_values.dtype), kept_values)
+    merged_values = torch.where(active_mask, new_vals.to(kept_values.dtype), kept_values)
 
-    return kept_keys.contiguous(), merged_values.contiguous()
+    if merge_keys:
+        key_accum = torch.zeros(bsz, num_key_value_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+        key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
+        new_keys = (kept_keys.float() + key_accum) / total_w
+        merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+    else:
+        merged_keys = kept_keys
+
+    return merged_keys.contiguous(), merged_values.contiguous()

@@ -667,3 +667,19 @@ class TestMergingAdaKVPress:
             MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=-0.1)
         with pytest.raises(AssertionError, match="score_weight_floor"):
             MergingAdaKVPress(press=KnormPress(compression_ratio=0.5), score_weight_floor=1.1)
+
+    def test_generation_no_sdpa_crash(self, unit_test_model):  # noqa: F811
+        """Verify that generate() works after MergingAdaKVPress prefill compression.
+
+        This is a regression test for the SDPA dimension-mismatch crash that
+        occurred when compress() returned physically reshaped tensors with
+        per-head variable budgets.  The fix uses virtual masking via
+        module.masked_key_indices instead.
+        """
+        torch.manual_seed(42)
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingAdaKVPress(press=base)
+        with wrapper(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+            outputs = unit_test_model.generate(input_ids, max_new_tokens=5, do_sample=False)
+            assert outputs.shape[1] > input_ids.shape[1], "No tokens generated"

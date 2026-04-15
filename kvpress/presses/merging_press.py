@@ -14,6 +14,9 @@ from kvpress.presses.scorer_press import ScorerPress
 
 logger = logging.getLogger(__name__)
 
+# Epsilon for numerical stability — safe for float16 (min ~6e-8) and bfloat16
+_EPS = 1e-6
+
 
 def _merge_on_evict(
     keys: torch.Tensor,
@@ -91,8 +94,20 @@ def _merge_on_evict(
     -------
     tuple[Tensor, Tensor]
         ``(merged_keys, merged_values)`` each of shape ``(B, H, n_kept, D)``.
+
+    Notes
+    -----
+    The perturbation bound above is an original derivation for this implementation.
+    The merge routing strategy is inspired by Token Merging (ToMe) but simplified
+    from bipartite matching to greedy max-cosine-similarity, and extended with
+    multi-stage weighting (similarity × value-norm × score × cap).
+
+    References
+    ----------
+    .. [1] Bolya et al., "Token Merging: Your ViT But Faster", ICLR 2023.
+       https://arxiv.org/abs/2210.09461
     """
-    bsz, num_kv_heads, k_len, head_dim = keys.shape
+    bsz, num_key_value_heads, k_len, head_dim = keys.shape
     n_evict = k_len - n_kept
 
     # --- Partition into keep / evict ---
@@ -100,9 +115,9 @@ def _merge_on_evict(
 
     # nonzero() returns indices in row-major (C-contiguous) order, so the
     # reshape below produces a correct (B, H, n_evict) partition.
-    mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+    mask = torch.ones(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
     mask.scatter_(2, keep_idx, False)
-    evict_idx = mask.nonzero(as_tuple=False)[:, 2].reshape(bsz, num_kv_heads, n_evict)
+    evict_idx = mask.nonzero(as_tuple=False)[:, 2].reshape(bsz, num_key_value_heads, n_evict)
 
     # --- Gather kept and evicted tensors ---
     idx4 = keep_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
@@ -115,7 +130,6 @@ def _merge_on_evict(
 
     # --- Batched cosine similarity → nearest survivor ---
     # Guard against zero-norm keys: clamp norms to avoid NaN from F.normalize
-    _EPS = 1e-6  # safe for both float16 (min ~6e-8) and bfloat16 (min ~1e-38 but precision ~1e-3)
     evict_keys_f = evict_keys.float()
     kept_keys_f = kept_keys.float()
     e_norms = evict_keys_f.norm(dim=-1, keepdim=True).clamp(min=_EPS)
@@ -137,21 +151,21 @@ def _merge_on_evict(
             return (
                 kept_keys.contiguous(),
                 kept_values.contiguous(),
-                {"n_merged": 0, "n_evicted": n_evict * bsz * num_kv_heads},
+                {"n_merged": 0, "n_evicted": n_evict * bsz * num_key_value_heads},
             )
         return kept_keys.contiguous(), kept_values.contiguous()
 
     if logger.isEnabledFor(logging.DEBUG):
         n_merged = merge_mask.sum().item()
-        merge_count = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device)
+        merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device)
         merge_count.scatter_add_(2, target_idx, merge_mask.float())
         max_count = merge_count.max().item()
         mean_sim = max_sim[merge_mask].mean().item()
         logger.debug(
             "merge_on_evict: %d/%d evicted tokens merged (%.1f%%), " "mean_sim=%.3f, max_merges_per_survivor=%.0f",
             n_merged,
-            n_evict * bsz * num_kv_heads,
-            100.0 * n_merged / (n_evict * bsz * num_kv_heads),
+            n_evict * bsz * num_key_value_heads,
+            100.0 * n_merged / (n_evict * bsz * num_key_value_heads),
             mean_sim,
             max_count,
         )
@@ -176,7 +190,7 @@ def _merge_on_evict(
 
     # --- Merge count cap: prevent survivor dilution ---
     if max_merge_per_token > 0:
-        merge_count = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device, dtype=torch.float32)
+        merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
         merge_count.scatter_add_(2, target_idx, merge_mask.float())
         excess = (merge_count / max_merge_per_token).clamp(min=1.0)
         evict_w = evict_w / excess.gather(2, target_idx)
@@ -185,10 +199,10 @@ def _merge_on_evict(
     tgt = target_idx.unsqueeze(-1).expand_as(evict_keys)  # (B, H, n_evict, D)
 
     # Accumulate in float32 for numerical stability
-    val_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+    val_accum = torch.zeros(bsz, num_key_value_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
     val_accum.scatter_add_(2, tgt, ew * evict_values.float())
 
-    w_accum = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device, dtype=torch.float32)
+    w_accum = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
     w_accum.scatter_add_(2, target_idx, evict_w)
 
     # --- Normalize: weighted average for active positions ---
@@ -200,7 +214,7 @@ def _merge_on_evict(
     merged_values = torch.where(active_mask, new_vals.to(kept_values.dtype), kept_values)
 
     if merge_keys:
-        key_accum = torch.zeros(bsz, num_kv_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
+        key_accum = torch.zeros(bsz, num_key_value_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
         key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
         new_keys = (kept_keys.float() + key_accum) / total_w
         merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
@@ -209,12 +223,12 @@ def _merge_on_evict(
 
     if collect_diagnostics:
         n_merged = merge_mask.sum().item()
-        merge_count = torch.zeros(bsz, num_kv_heads, n_kept, device=keys.device)
+        merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device)
         merge_count.scatter_add_(2, target_idx, merge_mask.float())
         diag = {
             "n_merged": n_merged,
-            "n_evicted": n_evict * bsz * num_kv_heads,
-            "merge_ratio": n_merged / (n_evict * bsz * num_kv_heads),
+            "n_evicted": n_evict * bsz * num_key_value_heads,
+            "merge_ratio": n_merged / (n_evict * bsz * num_key_value_heads),
             "mean_sim": max_sim[merge_mask].mean().item(),
             "min_sim": max_sim[merge_mask].min().item(),
             "max_sim": max_sim[merge_mask].max().item(),
@@ -310,7 +324,7 @@ class MergingPress(BasePress):
         if self.press.compression_ratio == 0:
             return keys, values
 
-        bsz, num_kv_heads, k_len, head_dim = keys.shape
+        bsz, num_key_value_heads, k_len, head_dim = keys.shape
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
 
         n_kept = int(k_len * (1 - self.press.compression_ratio))
@@ -430,56 +444,6 @@ class MergingDecodingPress(DecodingPress):
         return result[0], result[1]
 
 
-def _adakv_head_budgets(
-    scores: torch.Tensor,
-    n_kept: int,
-    alpha_safeguard: float,
-) -> torch.Tensor:
-    """
-    Compute per-head token budgets using the AdaKV adaptive allocation algorithm.
-
-    Selects the top ``n_kept * num_heads`` scores globally, then counts how many
-    land in each head.  A safeguard ensures every head retains at least
-    ``alpha_safeguard * n_kept`` tokens.
-
-    Parameters
-    ----------
-    scores : Tensor, shape ``(B, H, L)``
-    n_kept : int
-        Target tokens to keep *per head* (uniform baseline).
-    alpha_safeguard : float
-        Minimum fraction of ``n_kept`` guaranteed per head.
-
-    Returns
-    -------
-    Tensor, shape ``(B, H)``
-        Per-head token budget (int values stored as long).
-    """
-    bsz, num_heads, k_len = scores.shape
-    n_safe = int(n_kept * alpha_safeguard)
-    total_budget = n_kept * num_heads
-
-    # Protect top-n_safe per head from being deprioritised
-    protected_scores = scores.clone()
-    if n_safe > 0:
-        top_safe_idx = torch.topk(protected_scores, min(n_safe, k_len), dim=-1).indices
-        protected_scores.scatter_(-1, top_safe_idx, torch.finfo(scores.dtype).max)
-
-    # Global top-B across all heads → count per head
-    flat = protected_scores.reshape(bsz, -1)  # (B, H*L)
-    global_top_idx = torch.topk(flat, min(total_budget, flat.shape[-1]), dim=-1).indices  # (B, total_budget)
-    head_of_idx = global_top_idx // k_len  # (B, total_budget)
-
-    # Count per head
-    budgets = torch.zeros(bsz, num_heads, device=scores.device, dtype=torch.long)
-    for b in range(bsz):
-        budgets[b] = torch.bincount(head_of_idx[b], minlength=num_heads)[:num_heads]
-
-    # Enforce minimum
-    budgets = budgets.clamp(min=max(n_safe, 1))
-    return budgets
-
-
 @dataclass
 class MergingAdaKVPress(BasePress):
     """
@@ -513,8 +477,34 @@ class MergingAdaKVPress(BasePress):
     score_weighting : bool, default=False
         Scale merge weight by normalised importance score.
     adaptive_threshold : bool, default=False
-        Compute similarity threshold dynamically as the 25th percentile
-        of per-token maximum cosine similarities.
+        Compute similarity threshold dynamically as the ``adaptive_percentile``
+        quantile of per-token maximum cosine similarities.
+    adaptive_percentile : float, default=0.25
+        Quantile for adaptive thresholding.  Empirically chosen; lower is more
+        permissive.
+    score_weight_floor : float, default=0.5
+        Minimum merge weight when ``score_weighting=True``.
+
+    Notes
+    -----
+    The ``alpha_safeguard`` default of 0.20 matches the AdaKV paper.  Budget
+    allocation uses the same global-bottom-k mechanism as :class:`AdaKVPress`.
+
+    Unlike :class:`MergingPress`, the merge logic here is implemented inline
+    rather than delegating to :func:`_merge_on_evict`.  This is intentional:
+    AdaKV produces variable per-head budgets, so the cache retains its original
+    ``(B, H, L, D)`` shape with evicted positions masked via
+    ``module.masked_key_indices`` (the virtual-masking contract used by
+    :mod:`kvpress.attention_patch`).  The vectorised kernel assumes uniform
+    budgets and returns a physically smaller tensor.
+
+    References
+    ----------
+    .. [1] Feng et al., "AdaKV: Optimizing KV Cache Eviction by Adaptive Budget
+       Allocation for Efficient LLM Inference", 2024.
+       https://arxiv.org/abs/2407.11550
+    .. [2] Bolya et al., "Token Merging: Your ViT But Faster", ICLR 2023.
+       https://arxiv.org/abs/2210.09461
     """
 
     press: ScorerPress
@@ -563,7 +553,7 @@ class MergingAdaKVPress(BasePress):
 
         assert module.config._attn_implementation != "eager", "eager mode not supported"
 
-        bsz, num_kv_heads, k_len, head_dim = keys.shape
+        bsz, num_key_value_heads, k_len, head_dim = keys.shape
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
 
         n_kept_uniform = int(k_len * (1 - self.press.compression_ratio))
@@ -579,7 +569,7 @@ class MergingAdaKVPress(BasePress):
         safe_scores.scatter_(-1, top_safe, torch.finfo(scores.dtype).max)
 
         # Global bottom-k across heads (AdaKVPress approach)
-        n_pruned = num_kv_heads * (k_len - n_kept_uniform)
+        n_pruned = num_key_value_heads * (k_len - n_kept_uniform)
         flat_scores = safe_scores.reshape(bsz, -1)
         evict_flat = torch.topk(-flat_scores, n_pruned, dim=1).indices  # (B, n_pruned)
 
@@ -587,15 +577,14 @@ class MergingAdaKVPress(BasePress):
         evict_seq_idx = evict_flat % k_len     # (B, n_pruned)
 
         # --- Per-head merge: fold evicted values into most-similar survivors ---
-        _EPS = 1e-6
         # Build keep mask: True = kept, False = evicted
-        keep_mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+        keep_mask = torch.ones(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
         for b in range(bsz):
             keep_mask[b, evict_head_idx[b], evict_seq_idx[b]] = False
 
         # Process each head: merge evicted → survivor, modify values in-place
         all_diags = []
-        for h in range(num_kv_heads):
+        for h in range(num_key_value_heads):
             h_keep = keep_mask[:, h, :]  # (B, k_len)
             n_evict_h = (~h_keep).sum(dim=-1).min().item()  # min across batch
             if n_evict_h == 0:

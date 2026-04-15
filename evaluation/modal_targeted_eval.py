@@ -62,8 +62,7 @@ MODEL = "Qwen/Qwen3-8B"
 CRS = [0.25, 0.50, 0.75, 0.875]
 
 # Only merging variants — baselines taken from HF leaderboard
-# NOTE: merging_kvzap_mlp disabled due to KVzapConfig bug with transformers>=4.48
-MERGING_PRESSES = ["merging_cam_knorm"]
+MERGING_PRESSES = ["merging_kvzap_mlp", "merging_cam_knorm"]
 
 # Leaderboard baselines (NVIDIA/kvpress-leaderboard HF Space, Qwen3-8B RULER-4096)
 LEADERBOARD_BASELINES = {
@@ -71,7 +70,7 @@ LEADERBOARD_BASELINES = {
     "knorm": {0.25: 87.2, 0.50: 68.3, 0.75: 32.6, 0.875: 8.9},
 }
 
-SPEED_PRESSES = ["no_press", "merging_cam_knorm"]
+SPEED_PRESSES = ["no_press", "merging_kvzap_mlp", "merging_cam_knorm"]
 SPEED_CRS = [0.25, 0.50, 0.75]
 N_GENERATE = 50  # tokens to generate for speed test
 N_WARMUP = 1

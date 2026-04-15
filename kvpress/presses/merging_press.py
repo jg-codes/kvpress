@@ -561,6 +561,8 @@ class MergingAdaKVPress(BasePress):
         if self.press.compression_ratio == 0:
             return keys, values
 
+        assert module.config._attn_implementation != "eager", "eager mode not supported"
+
         bsz, num_kv_heads, k_len, head_dim = keys.shape
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
 
@@ -570,59 +572,130 @@ class MergingAdaKVPress(BasePress):
         if n_kept_uniform <= 0:
             return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
 
-        # --- Adaptive per-head budgets ---
-        budgets = _adakv_head_budgets(scores, n_kept_uniform, self.alpha_safeguard)  # (B, H)
-        max_budget = budgets.max().item()
+        # --- Adaptive per-head budgets (same as AdaKVPress safety mechanism) ---
+        n_safe = int(n_kept_uniform * self.alpha_safeguard)
+        top_safe = torch.topk(scores, n_safe, dim=-1).indices
+        safe_scores = scores.clone()
+        safe_scores.scatter_(-1, top_safe, torch.finfo(scores.dtype).max)
 
-        # --- Per-head merge-on-evict ---
-        # Process each head with its own budget, pad to max_budget for uniform output
-        all_keys = torch.zeros(bsz, num_kv_heads, max_budget, head_dim, device=keys.device, dtype=keys.dtype)
-        all_values = torch.zeros(bsz, num_kv_heads, max_budget, head_dim, device=keys.device, dtype=values.dtype)
+        # Global bottom-k across heads (AdaKVPress approach)
+        n_pruned = num_kv_heads * (k_len - n_kept_uniform)
+        flat_scores = safe_scores.reshape(bsz, -1)
+        evict_flat = torch.topk(-flat_scores, n_pruned, dim=1).indices  # (B, n_pruned)
+
+        evict_head_idx = evict_flat // k_len   # (B, n_pruned)
+        evict_seq_idx = evict_flat % k_len     # (B, n_pruned)
+
+        # --- Per-head merge: fold evicted values into most-similar survivors ---
+        _EPS = 1e-6
+        # Build keep mask: True = kept, False = evicted
+        keep_mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+        for b in range(bsz):
+            keep_mask[b, evict_head_idx[b], evict_seq_idx[b]] = False
+
+        # Process each head: merge evicted → survivor, modify values in-place
         all_diags = []
-
         for h in range(num_kv_heads):
-            h_keys = keys[:, h : h + 1, :, :]  # (B, 1, L, D)
-            h_values = values[:, h : h + 1, :, :]
-            h_scores = scores[:, h : h + 1, :]
-
-            # Use the *minimum* budget across the batch for this head for simplicity
-            h_budget = budgets[:, h].min().item()
-            h_budget = min(max(h_budget, 1), k_len)
-
-            if h_budget >= k_len:
-                # No compression for this head — pad
-                all_keys[:, h, :k_len, :] = keys[:, h, :, :]
-                all_values[:, h, :k_len, :] = values[:, h, :, :]
+            h_keep = keep_mask[:, h, :]  # (B, k_len)
+            n_evict_h = (~h_keep).sum(dim=-1).min().item()  # min across batch
+            if n_evict_h == 0:
                 continue
 
-            result = _merge_on_evict(
-                h_keys,
-                h_values,
-                h_scores,
-                h_budget,
-                self.similarity_threshold,
-                self.merge_keys,
-                self.value_norm_weighting,
-                self.max_merge_per_token,
-                self.collect_diagnostics,
-                self.score_weighting,
-                self.adaptive_threshold,
-                self.adaptive_percentile,
-                self.score_weight_floor,
-            )
-            if self.collect_diagnostics and len(result) == 3:
-                mk, mv, diag = result
-                diag["head"] = h
-                all_diags.append(diag)
-            else:
-                mk, mv = result[:2]
+            h_keys = keys[:, h, :, :]      # (B, k_len, D)
+            h_values = values[:, h, :, :]   # (B, k_len, D)
 
-            # mk, mv are (B, 1, h_budget, D) — place in padded output
-            hb = int(h_budget)
-            all_keys[:, h, :hb, :] = mk[:, 0, :, :]
-            all_values[:, h, :hb, :] = mv[:, 0, :, :]
+            # Get indices for this head
+            keep_idx_h = h_keep.nonzero(as_tuple=False)  # (total_kept, 2) [batch, seq]
+            evict_idx_h = (~h_keep).nonzero(as_tuple=False)  # (total_evict, 2) [batch, seq]
+
+            head_n_merged = 0
+            head_n_evicted = 0
+
+            # Per-batch processing for variable-length keep/evict sets
+            for b in range(bsz):
+                b_keep = keep_idx_h[keep_idx_h[:, 0] == b, 1]   # (n_kept_b,)
+                b_evict = evict_idx_h[evict_idx_h[:, 0] == b, 1]  # (n_evict_b,)
+                if b_evict.numel() == 0:
+                    continue
+
+                head_n_evicted += b_evict.numel()
+
+                kept_k = h_keys[b, b_keep, :]    # (n_kept_b, D)
+                evict_k = h_keys[b, b_evict, :]  # (n_evict_b, D)
+                evict_v = h_values[b, b_evict, :]  # (n_evict_b, D)
+
+                # Cosine similarity: evicted → kept
+                e_norm = evict_k.float() / evict_k.float().norm(dim=-1, keepdim=True).clamp(min=_EPS)
+                s_norm = kept_k.float() / kept_k.float().norm(dim=-1, keepdim=True).clamp(min=_EPS)
+                sim = torch.matmul(e_norm, s_norm.T)  # (n_evict, n_kept)
+                max_sim, tgt_local = sim.max(dim=-1)   # (n_evict,)
+
+                # Threshold gate
+                if self.adaptive_threshold:
+                    threshold = torch.quantile(max_sim.float(), self.adaptive_percentile)
+                    merge_mask_h = max_sim >= threshold
+                else:
+                    merge_mask_h = max_sim >= self.similarity_threshold
+
+                if not merge_mask_h.any():
+                    continue
+
+                head_n_merged += int(merge_mask_h.sum().item())
+
+                # Map local target indices back to global seq positions
+                tgt_global = b_keep[tgt_local]  # (n_evict,)
+
+                # Compute merge weights
+                w = max_sim.clamp(min=0) * merge_mask_h.float()  # (n_evict,)
+
+                if self.value_norm_weighting:
+                    ev_vnorm = evict_v.float().norm(dim=-1)
+                    tgt_vnorm = h_values[b, tgt_global, :].float().norm(dim=-1)
+                    rel_norm = ev_vnorm / (ev_vnorm + tgt_vnorm + _EPS)
+                    w = w * rel_norm
+
+                # Scatter-add merge into survivors (in-place on values)
+                # For each survivor: new_v = (orig_v + sum(w_i * evict_v_i)) / (1 + sum(w_i))
+                n_kept_b = b_keep.numel()
+                val_accum = torch.zeros(n_kept_b, head_dim, device=keys.device, dtype=torch.float32)
+                w_accum = torch.zeros(n_kept_b, device=keys.device, dtype=torch.float32)
+
+                # tgt_local maps evicted tokens to kept array index
+                val_accum.scatter_add_(0, tgt_local.unsqueeze(-1).expand_as(evict_v), w.unsqueeze(-1) * evict_v.float())
+                w_accum.scatter_add_(0, tgt_local, w)
+
+                active = w_accum > 0
+                if active.any():
+                    total_w = (1.0 + w_accum).unsqueeze(-1)  # (n_kept_b, 1)
+                    orig_v = h_values[b, b_keep, :].float()
+                    new_v = (orig_v + val_accum) / total_w
+                    # Write back only where merging happened
+                    active_kept = b_keep[active]
+                    values[b, h, active_kept, :] = new_v[active].to(values.dtype)
+
+                    if self.merge_keys:
+                        key_accum = torch.zeros(n_kept_b, head_dim, device=keys.device, dtype=torch.float32)
+                        key_accum.scatter_add_(
+                            0, tgt_local.unsqueeze(-1).expand_as(evict_k), w.unsqueeze(-1) * evict_k.float()
+                        )
+                        orig_k = h_keys[b, b_keep, :].float()
+                        new_k = (orig_k + key_accum) / total_w
+                        keys[b, h, active_kept, :] = new_k[active].to(keys.dtype)
+
+            if self.collect_diagnostics and head_n_evicted > 0:
+                all_diags.append({
+                    "head": h,
+                    "n_merged": head_n_merged,
+                    "n_evicted": head_n_evicted,
+                    "merge_ratio": head_n_merged / head_n_evicted if head_n_evicted else 0,
+                })
 
         if self.collect_diagnostics and all_diags:
             self.diagnostics.append(all_diags)
 
-        return all_keys.contiguous(), all_values.contiguous()
+        # Set masked_key_indices for attention patch (same as AdaKVPress)
+        batch_indices = torch.arange(bsz, device=keys.device).repeat_interleave(n_pruned)
+        module.masked_key_indices = (  # type: ignore[assignment]
+            batch_indices, evict_head_idx.flatten(), evict_seq_idx.flatten()
+        )
+        return keys, values

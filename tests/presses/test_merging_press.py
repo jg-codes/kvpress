@@ -113,3 +113,94 @@ class TestMergingPress:
 
         assert diff_hi <= diff_lo, f"High-threshold diff ({diff_hi}) > low-threshold diff ({diff_lo})"
 
+    def test_default_preserves_keys(self, unit_test_model):  # noqa: F811
+        """Default merge_keys=False should not modify keys (preserves RoPE)."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        with base(unit_test_model):
+            cache_hard = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_hard)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base2)  # defaults: merge_keys=False, value_norm_weighting=True
+        with wrapper(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        for i in range(len(cache_hard.layers)):
+            assert torch.equal(
+                cache_hard.layers[i].keys, cache_merge.layers[i].keys
+            ), f"Layer {i}: default merge_keys=False should not modify keys"
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_half_precision_no_nan(self, unit_test_model, dtype):  # noqa: F811
+        """Merged keys/values must be finite in float16 and bfloat16."""
+        model = unit_test_model.to(dtype)
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+        with wrapper(model):
+            cache = DynamicCache()
+            model(input_ids, past_key_values=cache)
+
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), f"Non-finite keys with {dtype}"
+            assert torch.isfinite(layer.values).all(), f"Non-finite values with {dtype}"
+            assert layer.keys.dtype == dtype
+        model.float()
+
+    def test_repeated_compression_stable(self, unit_test_model):  # noqa: F811
+        """MergingPress can be applied multiple times (simulating streaming/multi-turn)."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.4)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0)
+
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        seq_lengths = [cache.get_seq_length()]
+        for _ in range(3):
+            with wrapper(unit_test_model):
+                new_tokens = torch.randint(0, 1024, (1, 16), device=unit_test_model.device)
+                unit_test_model(new_tokens, past_key_values=cache)
+            seq_lengths.append(cache.get_seq_length())
+
+        for layer in cache.layers:
+            assert torch.isfinite(layer.keys).all(), "Non-finite keys after repeated compression"
+            assert torch.isfinite(layer.values).all(), "Non-finite values after repeated compression"
+
+        assert (
+            seq_lengths[-1] < 128 + 3 * 16
+        ), f"Cache grew to {seq_lengths[-1]} — compression not applied during recompression rounds"
+
+    def test_value_norm_weighting_differs(self, unit_test_model):  # noqa: F811
+        """value_norm_weighting=True should produce different merge results."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, similarity_threshold=0.0, value_norm_weighting=False)
+        with wrapper(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrapper2 = MergingPress(press=base2, similarity_threshold=0.0, value_norm_weighting=True)
+        with wrapper2(unit_test_model):
+            cache_vnorm = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_vnorm)
+
+        any_different = False
+        for i in range(len(cache_plain.layers)):
+            if not torch.equal(cache_plain.layers[i].values, cache_vnorm.layers[i].values):
+                any_different = True
+                break
+        assert any_different, "value_norm_weighting did not change merge results"
+

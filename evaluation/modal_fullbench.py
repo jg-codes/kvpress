@@ -113,7 +113,7 @@ def run_variant(press_name: str, label: str) -> dict:
 def main():
     """Launch all variants in parallel, collect and display results."""
     print(f"\n{'='*80}")
-    print(f"MergingPress FULL Benchmark on Modal")
+    print("MergingPress FULL Benchmark on Modal")
     print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR} | CR: {CR}")
     print(f"Fraction: {FRACTION} (full dataset) | Seed: {SEED}")
     print(f"Variants: {len(VARIANTS)}")

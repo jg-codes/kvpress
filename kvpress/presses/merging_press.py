@@ -413,7 +413,7 @@ class MergingDecodingPress(DecodingPress):
         scores = self.base_press.score(module, hidden_states, keys, values, attentions, kwargs)
         self.base_press.compression_ratio = original_cr
 
-        return _merge_on_evict(
+        result = _merge_on_evict(
             keys,
             values,
             scores,
@@ -427,6 +427,7 @@ class MergingDecodingPress(DecodingPress):
             adaptive_percentile=self.adaptive_percentile,
             score_weight_floor=self.score_weight_floor,
         )
+        return result[0], result[1]
 
 
 def _adakv_head_budgets(
@@ -617,8 +618,9 @@ class MergingAdaKVPress(BasePress):
                 mk, mv = result[:2]
 
             # mk, mv are (B, 1, h_budget, D) — place in padded output
-            all_keys[:, h, :h_budget, :] = mk[:, 0, :, :]
-            all_values[:, h, :h_budget, :] = mv[:, 0, :, :]
+            hb = int(h_budget)
+            all_keys[:, h, :hb, :] = mk[:, 0, :, :]
+            all_values[:, h, :hb, :] = mv[:, 0, :, :]
 
         if self.collect_diagnostics and all_diags:
             self.diagnostics.append(all_diags)

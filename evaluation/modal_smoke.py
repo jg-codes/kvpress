@@ -271,7 +271,7 @@ def main(fraction: float = 0.001, sweep: bool = False):
     seen_bases = set()
     MERGE_PREFIX = "merging_"
     for label, r in table.items():
-        pn = r["press_name"]
+        pn = str(r["press_name"])  # type: ignore[index]
         if (
             pn.startswith(MERGE_PREFIX)
             and not pn.startswith("merging_adakv_")

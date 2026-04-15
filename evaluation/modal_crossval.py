@@ -12,8 +12,6 @@ Usage:
 """
 
 import json
-import subprocess
-import sys
 
 import modal
 
@@ -123,7 +121,7 @@ def run_variant(press_name: str, label: str) -> dict:
 def main():
     """Launch all variants in parallel, collect and display results."""
     print(f"\n{'='*80}")
-    print(f"MergingPress Cross-Validation on Modal")
+    print("MergingPress Cross-Validation on Modal")
     print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR} | CR: {CR} | Fraction: {FRACTION} | Seed: {SEED}")
     print(f"Variants: {len(VARIANTS)}")
     print(f"{'='*80}\n")

@@ -219,7 +219,7 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
 
     model_short = model.split("/")[-1]
     print(f"\n{'='*100}")
-    print(f"Ablation Sweep — Modal")
+    print("Ablation Sweep — Modal")
     print(f"Model: {model} | Dataset: {DATASET}-{DATA_DIR} | Fraction: {fraction} | Seed: {SEED}")
     print(f"Jobs: {len(jobs)} ({len(ABLATION_VARIANTS)} variants × {len(CRS)} CRs + no_press)")
     print(f"{'='*100}\n")
@@ -310,7 +310,9 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                     sig = "*" if pr["p_value"] < 0.05 else " "
                     wlt = f"{pr['positive']}/{pr['negative']}/{pr['tied']}"
                     print(
-                        f"{config_name:<18} {scorer:<20} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig} {wlt:>7}"
+                        f"{config_name:<18} {scorer:<20} {cr:>5.2f} {b['mean']:>6.1f}"
+                        f" {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16}"
+                        f" {pr['p_value']:>6.4f}{sig} {wlt:>7}"
                     )
 
     # --- Head-to-head: vonorm vs score (same scorer, same CR) ---
@@ -341,7 +343,8 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                 ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                 sig = "*" if pr["p_value"] < 0.05 else " "
                 print(
-                    f"{scorer:<20} {cr:>5.2f} {v['mean']:>6.1f} {s['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
+                    f"{scorer:<20} {cr:>5.2f} {v['mean']:>6.1f} {s['mean']:>6.1f}"
+                    f" {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
                 )
 
     # --- Head-to-head: MergingAdaKV vs AdaKV (does merge help on top of adaptive allocation?) ---
@@ -374,7 +377,9 @@ def main(fraction: float = 0.01, model: str = "meta-llama/Llama-3.2-1B-Instruct"
                 ci_str = f"[{pr['ci_lo']:+.1f}, {pr['ci_hi']:+.1f}]"
                 sig = "*" if pr["p_value"] < 0.05 else " "
                 print(
-                    f"{base_name} vs {merge_name:<15} {cr:>5.2f} {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f} {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
+                    f"{base_name} vs {merge_name:<15} {cr:>5.2f}"
+                    f" {b['mean']:>6.1f} {m['mean']:>6.1f} {pr['mean_delta']:>+6.1f}"
+                    f" {ci_str:>16} {pr['p_value']:>6.4f}{sig}"
                 )
 
     print(f"{'='*115}")

@@ -64,13 +64,24 @@ CRS = [0.25, 0.50, 0.75, 0.875]
 # Only merging variants — baselines taken from HF leaderboard
 MERGING_PRESSES = ["merging_kvzap_mlp", "merging_cam_knorm"]
 
+# AdaKV fraction benchmark (f=0.1): paired comparison of merge vs non-merge
+ADA_PRESSES = [("merging_adakv_snapkv", "adakv_snapkv")]
+ADA_FRACTION = 0.1
+
 # Leaderboard baselines (NVIDIA/kvpress-leaderboard HF Space, Qwen3-8B RULER-4096)
 LEADERBOARD_BASELINES = {
     "no_press": {0.0: 95.3},
     "knorm": {0.25: 87.2, 0.50: 68.3, 0.75: 32.6, 0.875: 8.9},
 }
 
-SPEED_PRESSES = ["no_press", "merging_kvzap_mlp", "merging_cam_knorm"]
+SPEED_PRESSES = [
+    "no_press",
+    "merging_kvzap_mlp",
+    "merging_cam_knorm",
+    "merging_adakv_snapkv",
+    "adakv_snapkv",
+    "knorm",
+]
 SPEED_CRS = [0.25, 0.50, 0.75]
 N_GENERATE = 50  # tokens to generate for speed test
 N_WARMUP = 1
@@ -82,6 +93,16 @@ def build_leaderboard_jobs(presses):
     for p in presses:
         for cr in CRS:
             jobs.append((p, cr))
+    return jobs
+
+
+def build_ada_jobs():
+    """Build jobs for AdaKV fraction benchmark: both merging and baseline."""
+    jobs = []
+    for merge_name, base_name in ADA_PRESSES:
+        for cr in CRS:
+            jobs.append((merge_name, cr))
+            jobs.append((base_name, cr))
     return jobs
 
 
@@ -130,6 +151,59 @@ def run_leaderboard(press_name: str, cr: float) -> dict:
             metrics = json.load(f)
 
     return {"press_name": press_name, "cr": cr, "metrics": metrics, "files": result_files}
+
+
+# ---------------------------------------------------------------------------
+# Fraction eval (one press × CR, configurable fraction for quick comparison)
+# ---------------------------------------------------------------------------
+@app.function(gpu="A100", timeout=3600, memory=65536, scaledown_window=2, secrets=_secrets)
+def run_fraction_eval(press_name: str, cr: float, fraction: float = 0.1) -> dict:
+    import glob
+    import os
+    import sys
+
+    sys.path.insert(0, "/eval_repo/evaluation")
+    os.chdir("/eval_repo/evaluation")
+
+    from evaluate import EvaluationConfig, EvaluationRunner
+
+    output_tag = f"{press_name}__{cr:.3f}__f{fraction}"
+    config = EvaluationConfig(
+        dataset=DATASET,
+        data_dir=DATA_DIR,
+        model=MODEL,
+        device="cuda:0",
+        press_name=press_name,
+        compression_ratio=cr,
+        fraction=fraction,
+        seed=42,
+        output_dir=f"/results/{output_tag}",
+    )
+
+    runner = EvaluationRunner(config)
+    runner.run_evaluation()
+
+    result_files = {}
+    base = f"/results/{output_tag}"
+    for path in glob.glob(f"{base}/**/*", recursive=True):
+        if os.path.isfile(path):
+            rel = os.path.relpath(path, "/results")
+            with open(path) as f:
+                result_files[rel] = f.read()
+
+    metrics_files = glob.glob(f"{base}/**/metrics.json", recursive=True)
+    metrics = {}
+    if metrics_files:
+        with open(metrics_files[0]) as f:
+            metrics = json.load(f)
+
+    return {
+        "press_name": press_name,
+        "cr": cr,
+        "fraction": fraction,
+        "metrics": metrics,
+        "files": result_files,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +314,13 @@ def flatten_score(val):
 def main(
     speed_only: bool = False,
     leaderboard_only: bool = False,
+    ada_only: bool = False,
 ):
     output_dir = pathlib.Path("evaluation/results_targeted")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Leaderboard ---
-    if not speed_only:
+    if not speed_only and not ada_only:
         jobs = build_leaderboard_jobs(MERGING_PRESSES)
         print(f"\n{'='*80}")
         print(f"Leaderboard Eval: {len(jobs)} jobs | Model: {MODEL} | RULER-{DATA_DIR}")
@@ -311,8 +386,95 @@ def main(
 
         (output_dir / "leaderboard_summary.json").write_text(json.dumps(table, indent=2))
 
+    # --- AdaKV fraction benchmark ---
+    if ada_only or (not speed_only and not leaderboard_only):
+        ada_jobs = build_ada_jobs()
+        print(f"\n{'='*80}")
+        print(
+            f"AdaKV Fraction Eval: {len(ada_jobs)} jobs | "
+            f"Model: {MODEL} | RULER-{DATA_DIR} | f={ADA_FRACTION}"
+        )
+        print(f"Pairs: {ADA_PRESSES}")
+        print(f"{'='*80}\n")
+
+        ada_results = list(
+            run_fraction_eval.starmap(
+                [(p, cr, ADA_FRACTION) for p, cr in ada_jobs],
+                return_exceptions=True,
+            )
+        )
+
+        ada_table = {}
+        ada_errors = []
+        for i, r in enumerate(ada_results):
+            press_name, cr = ada_jobs[i]
+            label = f"{press_name} (cr={cr:.3f})"
+
+            if isinstance(r, Exception):
+                ada_errors.append({"variant": press_name, "cr": cr, "error": str(r)})
+                continue
+            if "error" in r.get("metrics", {}):
+                ada_errors.append(
+                    {"variant": press_name, "cr": cr, "error": r["metrics"]["error"]}
+                )
+                continue
+
+            for rel_path, content in r.get("files", {}).items():
+                file_path = (
+                    output_dir
+                    / "ada"
+                    / (rel_path.split("/", 1)[-1] if "/" in rel_path else rel_path)
+                )
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content)
+
+            m = r["metrics"]
+            tasks = sorted(m.keys())
+            scores = [flatten_score(m[t]) for t in tasks]
+            mean = sum(scores) / len(scores) if scores else 0.0
+            ada_table[label] = {
+                "press_name": press_name,
+                "cr": cr,
+                "mean": round(mean, 2),
+                "per_task": {t: flatten_score(m[t]) for t in tasks},
+            }
+
+        # Print AdaKV results
+        print(f"\n{'Variant':<45} {'Mean':>6}")
+        print(f"{'-'*55}")
+        for label, r in sorted(
+            ada_table.items(), key=lambda x: (x[1]["cr"], -x[1]["mean"])
+        ):
+            print(f"{label:<45} {r['mean']:>6.1f}")
+
+        # Paired comparison: merging vs baseline
+        print(f"\n{'Merging':<30} {'CR':>5} {'Base':>6} {'Mrg':>6} {'Δ':>6} {'Δ%rel':>7}")
+        print(f"{'-'*60}")
+        for merge_name, base_name in ADA_PRESSES:
+            for cr in CRS:
+                m_label = f"{merge_name} (cr={cr:.3f})"
+                b_label = f"{base_name} (cr={cr:.3f})"
+                if m_label in ada_table and b_label in ada_table:
+                    m_mean = ada_table[m_label]["mean"]
+                    b_mean = ada_table[b_label]["mean"]
+                    delta = m_mean - b_mean
+                    rel_pct = (delta / b_mean * 100) if b_mean > 0 else 0.0
+                    sig = "+" if delta > 0 else ""
+                    print(
+                        f"{merge_name:<30} {cr:>5.3f}"
+                        f" {b_mean:>6.1f} {m_mean:>6.1f}"
+                        f" {sig}{delta:>5.1f} {sig}{rel_pct:>6.1f}%"
+                    )
+
+        if ada_errors:
+            print(f"\n--- AdaKV Errors ({len(ada_errors)}) ---")
+            for e in ada_errors:
+                print(f"  {e['variant']} CR={e['cr']}: {e['error']}")
+
+        (output_dir / "ada_summary.json").write_text(json.dumps(ada_table, indent=2))
+
     # --- Speed ---
-    if not leaderboard_only:
+    if not leaderboard_only and not ada_only:
         speed_jobs = []
         for p in SPEED_PRESSES:
             if p == "no_press":

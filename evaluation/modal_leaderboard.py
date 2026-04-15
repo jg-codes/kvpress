@@ -52,6 +52,9 @@ image = (
 
 app = modal.App("kvpress-leaderboard", image=image)
 
+# Persistent volume — survives container restarts / orchestrator disconnects
+results_vol = modal.Volume.from_name("kvpress-leaderboard-results", create_if_missing=True)
+
 # ---------------------------------------------------------------------------
 # Leaderboard config (must match upstream leaderboard.sh)
 # ---------------------------------------------------------------------------
@@ -99,12 +102,13 @@ def build_jobs(presses: list[str]) -> list[tuple[str, float]]:
 # Need A100-40GB for Qwen3-8B in fp16
 @app.function(
     gpu="A100",
-    timeout=3600,
+    timeout=25200,  # 7 hours — RULER-4096 fraction=1.0 takes 3-6h on A100
     memory=65536,
     scaledown_window=2,
     secrets=_secrets,
+    volumes={"/results": results_vol},
 )
-def run_one(press_name: str, cr: float) -> dict:
+def run_one(press_name: str, cr: float, fraction: float = 1.0) -> dict:
     """Run a single (variant, CR) leaderboard evaluation."""
     import glob
     import os
@@ -123,13 +127,16 @@ def run_one(press_name: str, cr: float) -> dict:
         device="cuda:0",
         press_name=press_name,
         compression_ratio=cr,
-        fraction=1.0,
+        fraction=fraction,
         seed=42,
         output_dir=f"/results/{output_tag}",
     )
 
     runner = EvaluationRunner(config)
     runner.run_evaluation()
+
+    # Persist results to volume so they survive orchestrator disconnects
+    results_vol.commit()
 
     # Collect ALL output files for leaderboard submission
     result_files = {}
@@ -165,6 +172,7 @@ def flatten_score(val) -> float:
 def main(
     presses: str = "",
     include_baselines: bool = False,
+    fraction: float = 1.0,
 ):
     """Launch leaderboard evaluation on Modal."""
     if presses:
@@ -176,14 +184,17 @@ def main(
         press_list = BASELINE_PRESSES + press_list
 
     jobs = build_jobs(press_list)
+    # Add fraction as third element to each job tuple
+    jobs_with_fraction = [(p, cr, fraction) for p, cr in jobs]
 
+    frac_label = f"fraction={fraction}" if fraction < 1.0 else "full dataset"
     print(f"\n{'='*100}")
     print("KVPress Leaderboard Evaluation — Modal A100")
-    print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR}")
+    print(f"Model: {MODEL} | Dataset: {DATASET}-{DATA_DIR} | {frac_label}")
     print(f"Presses: {len(press_list)} | Jobs: {len(jobs)} ({len(press_list)} × {len(CRS)} CRs + no_press)")
     print(f"{'='*100}\n")
 
-    results = list(run_one.starmap(jobs, return_exceptions=True))
+    results = list(run_one.starmap(jobs_with_fraction, return_exceptions=True))
 
     # Save result files to local disk (leaderboard submission format)
     output_dir = pathlib.Path("evaluation/results_lb")

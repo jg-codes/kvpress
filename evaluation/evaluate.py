@@ -406,16 +406,35 @@ class EvaluationRunner:
         logger.info("Model pipeline loaded.")
 
     @torch.inference_mode()
-    def _run_inference(self):
+    def _run_inference(self, checkpoint_path: Optional[Path] = None, checkpoint_interval: int = 200):
         """
         Executes the inference process on the prepared dataset using the model pipeline.
+
+        Parameters
+        ----------
+        checkpoint_path : Path, optional
+            If provided, saves incremental predictions every ``checkpoint_interval``
+            contexts so that progress survives container restarts.
+        checkpoint_interval : int
+            Number of contexts between incremental saves (default 200).
         """
 
-        self.df["predicted_answer"] = None  # type: ignore[index]
+        if "predicted_answer" not in self.df.columns:
+            self.df["predicted_answer"] = None  # type: ignore[index]
+
+        def _maybe_checkpoint(processed: int) -> None:
+            if checkpoint_path and processed % checkpoint_interval == 0 and processed > 0:
+                self._save_results(checkpoint_path)
+                logger.info(f"Checkpoint saved ({processed} contexts processed)")
 
         if isinstance(self.press, DecodingPress):
             logger.info("DecodingPress detected, running inference for each context-question pair.")
-            for index, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Running Inference"):
+            already_done = self.df["predicted_answer"].notna()
+            remaining = self.df[~already_done]
+            if already_done.any():
+                logger.info(f"Resuming: {already_done.sum()} rows already have predictions, {len(remaining)} remaining")
+            processed = 0
+            for index, row in tqdm(remaining.iterrows(), total=len(remaining), desc="Running Inference"):
                 context = row["context"]
                 question = row["question"]
                 answer_prefix = row["answer_prefix"]
@@ -431,6 +450,8 @@ class EvaluationRunner:
                 )
                 self.df.loc[index, "predicted_answer"] = output["answer"]  # type: ignore[union-attr]
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
+                processed += 1
+                _maybe_checkpoint(processed)
 
         else:
             df_context_grouped = self.df.groupby("context")  # type: ignore[union-attr]
@@ -438,10 +459,25 @@ class EvaluationRunner:
                 df_context_grouped["answer_prefix"].nunique() == 1
             ), "Inconsistent 'answer_prefix' within the same context group detected."
 
+            # Skip contexts that already have predictions (resume support)
+            done_contexts = set()
+            if self.df["predicted_answer"].notna().any():
+                done_contexts = set(
+                    self.df.loc[self.df["predicted_answer"].notna(), "context"].unique()
+                )
+                logger.info(
+                    f"Resuming: {len(done_contexts)} contexts already done, "
+                    f"{self.df['context'].nunique() - len(done_contexts)} remaining"
+                )
+
             logger.info("Starting inference...")
+            processed = 0
             for context, df_group in tqdm(
                 df_context_grouped, total=self.df["context"].nunique(), desc="Running Inference"
             ):  # type: ignore[union-attr]
+                if context in done_contexts:
+                    continue
+
                 questions = df_group["question"].to_list()
                 # Use max_new_tokens from config, or fallback to dataset's default for the task
                 max_new_tokens = self.config.max_new_tokens or df_group["max_new_tokens"].iloc[0]
@@ -464,7 +500,13 @@ class EvaluationRunner:
                     else 0.0
                 )  # type: ignore[union-attr, attr-defined]
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
+                processed += 1
+                _maybe_checkpoint(processed)
 
+        # Final checkpoint
+        if checkpoint_path:
+            self._save_results(checkpoint_path)
+            logger.info(f"Final checkpoint saved ({processed} contexts processed)")
         logger.info("Inference completed.")
 
     def _save_results(self, save_filename: Path):

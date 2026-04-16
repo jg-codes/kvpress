@@ -151,6 +151,8 @@ def run_one(config: dict, fraction: float = 0.10) -> dict:
     sys.path.insert(0, "/eval_repo/evaluation")
     os.chdir("/eval_repo/evaluation")
 
+    import kvpress  # noqa: F401 — registers kv-press-text-generation pipeline
+
     from benchmarks.ruler.calculate_metrics import calculate_metrics as ruler_scorer
 
     name = config["name"]

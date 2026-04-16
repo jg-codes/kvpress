@@ -41,8 +41,8 @@ image = (
         "tqdm",
         "accelerate",
     )
-    # Force rebuild with merge_fraction changes
-    .run_commands(f"pip install --no-cache-dir 'kvpress @ git+https://github.com/jg-codes/kvpress.git@{BRANCH}'")
+    # Cache-bust v2: merge_fraction commit 75c43cd
+    .run_commands(f"pip install --no-cache-dir 'kvpress[kvzap] @ git+https://github.com/jg-codes/kvpress.git@{BRANCH}'")
     .pip_install("jieba", "bert_score", "fuzzywuzzy", "python-Levenshtein", "nltk", "rouge")
     .pip_install("skorch", "scikit-learn")
     .run_commands(
@@ -88,6 +88,8 @@ def _build_press(archetype: str, merge_fraction: float, similarity_threshold: fl
 
 def _build_baseline(name: str):
     """Construct baseline press (no merge params)."""
+    if name == "no_press":
+        return None
     from kvpress import AdaKVPress, KVzapPress
 
     if name == "kvzap_bare":
@@ -128,10 +130,10 @@ def run_one(
 
     # Build and inject the custom press into the registry
     dynamic_name = f"__sweep__{tag}"
-    if is_baseline:
-        PRESS_REGISTRY[dynamic_name] = _build_baseline(press_archetype)
-    elif press_archetype == "no_press":
+    if press_archetype == "no_press":
         dynamic_name = "no_press"
+    elif is_baseline:
+        PRESS_REGISTRY[dynamic_name] = _build_baseline(press_archetype)
     else:
         PRESS_REGISTRY[dynamic_name] = _build_press(
             press_archetype, merge_fraction, similarity_threshold

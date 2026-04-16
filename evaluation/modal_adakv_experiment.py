@@ -82,6 +82,7 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
     import glob
     import os
     import sys
+    import time
 
     sys.path.insert(0, "/eval_repo/evaluation")
     os.chdir("/eval_repo/evaluation")
@@ -102,7 +103,9 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
     )
 
     runner = EvaluationRunner(config)
+    t0 = time.monotonic()
     runner.run_evaluation()
+    elapsed_seconds = round(time.monotonic() - t0, 1)
     results_vol.commit()
 
     result_files = {}
@@ -125,6 +128,7 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
         "fraction": fraction,
         "metrics": metrics,
         "files": result_files,
+        "elapsed_seconds": elapsed_seconds,
     }
 
 
@@ -176,14 +180,16 @@ def main(fraction: float = 0.05):
         tasks = sorted(m.keys())
         scores = [flatten_score(m[t]) for t in tasks]
         mean = sum(scores) / len(scores) if scores else 0.0
-        table[label] = {"press_name": press_name, "cr": cr, "mean": round(mean, 2), "n_tasks": len(tasks)}
+        table[label] = {"press_name": press_name, "cr": cr, "mean": round(mean, 2), "n_tasks": len(tasks), "elapsed_s": r.get("elapsed_seconds")}
 
     # Print summary table
     print(f"\n{'='*80}")
-    print(f"{'Variant':<55} {'Mean':>6}  {'n':>3}")
+    print(f"{'Variant':<55} {'Mean':>6}  {'n':>3}  {'Time':>7}")
     print(f"{'-'*80}")
     for label, r in sorted(table.items(), key=lambda x: (x[1]["cr"], -x[1]["mean"])):
-        print(f"{label:<55} {r['mean']:>6.1f}  {r['n_tasks']:>3}")
+        t = r.get("elapsed_s")
+        t_str = f"{t:.0f}s" if t is not None else "—"
+        print(f"{label:<55} {r['mean']:>6.1f}  {r['n_tasks']:>3}  {t_str:>7}")
 
     # Delta: MergingPress(AdaKV(X)) vs AdaKV(X) vs MergingPress(X)
     print(f"\n{'='*80}")

@@ -93,6 +93,7 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
     import glob
     import os
     import sys
+    import time
 
     sys.path.insert(0, "/eval_repo/evaluation")
     os.chdir("/eval_repo/evaluation")
@@ -113,7 +114,9 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
     )
 
     runner = EvaluationRunner(config)
+    t0 = time.monotonic()
     runner.run_evaluation()
+    elapsed_seconds = round(time.monotonic() - t0, 1)
     results_vol.commit()
 
     result_files = {}
@@ -136,6 +139,7 @@ def run_one(press_name: str, cr: float, fraction: float = 0.05) -> dict:
         "fraction": fraction,
         "metrics": metrics,
         "files": result_files,
+        "elapsed_seconds": elapsed_seconds,
     }
 
 
@@ -193,14 +197,17 @@ def main(fraction: float = 0.05):
             "mean": round(mean, 2),
             "n_tasks": len(tasks),
             "per_task": {t: round(flatten_score(m[t]), 2) for t in tasks},
+            "elapsed_s": r.get("elapsed_seconds"),
         }
 
     # ── Summary table ──────────────────────────────────────────────────
     print(f"\n{'='*80}")
-    print(f"{'Variant':<55} {'Mean':>6}  {'n':>3}")
+    print(f"{'Variant':<55} {'Mean':>6}  {'n':>3}  {'Time':>7}")
     print(f"{'-'*80}")
     for label, r in sorted(table.items(), key=lambda x: (x[1]["cr"], -x[1]["mean"])):
-        print(f"{label:<55} {r['mean']:>6.1f}  {r['n_tasks']:>3}")
+        t = r.get("elapsed_s")
+        t_str = f"{t:.0f}s" if t is not None else "—"
+        print(f"{label:<55} {r['mean']:>6.1f}  {r['n_tasks']:>3}  {t_str:>7}")
 
     # ── Per-task breakdown for KVzap variants ──────────────────────────
     kvzap_presses = ["kvzap_mlp_head", "kvzap_mlp_layer", "merging_kvzap_mlp", "merging_adakv_kvzap"]

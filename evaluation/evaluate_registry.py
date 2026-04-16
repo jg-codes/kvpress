@@ -130,5 +130,11 @@ PRESS_REGISTRY = {
     # MergingDecodingPress: merge-on-evict during decoding (position-agnostic alternative to CAMPress)
     "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
     "merging_decoding_adakv_snapkv": MergingDecodingPress(base_press=AdaKVPress(SnapKVPress())),
+    # MergingPress(KVzapPress): merge-on-evict with neural surrogate scorer
+    "merging_kvzap_mlp": MergingPress(KVzapPress(model_type="mlp")),
+    # MergingPress(AdaKVPress(...)): adaptive per-head budget + merge-on-evict
+    "merging_adakv_ea": MergingPress(AdaKVPress(ExpectedAttentionPress(epsilon=1e-2))),
+    "merging_adakv_snapkv": MergingPress(AdaKVPress(SnapKVPress())),
+    "merging_adakv_knorm": MergingPress(AdaKVPress(KnormPress())),
     "expected_attention_bare": ExpectedAttentionPress(epsilon=1e-2),
 }

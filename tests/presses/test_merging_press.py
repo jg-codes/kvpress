@@ -12,8 +12,8 @@ from tests.fixtures import unit_test_model  # noqa: F401
 
 
 class TestMergingPress:
-    def test_requires_scorer_press(self):
-        with pytest.raises(AssertionError, match="requires a ScorerPress"):
+    def test_requires_base_press(self):
+        with pytest.raises(AssertionError, match="requires a BasePress"):
             MergingPress(press="not_a_press")
 
     def test_threshold_bounds(self):
@@ -332,7 +332,7 @@ class TestMergingDecodingPress:
         assert press.target_size == 2048
         assert press.similarity_threshold == 0.0
 
-    def test_compress_override(self, unit_test_model):
+    def test_compress_override(self, unit_test_model):  # noqa: F811
         """Compress delegates to _merge_on_evict instead of hard eviction."""
         press = MergingDecodingPress(
             base_press=KnormPress(),
@@ -360,3 +360,68 @@ class TestMergingDecodingPress:
         assert press.value_norm_weighting is False
         assert press.max_merge_per_token == 3
         assert press.target_size == 512
+
+
+
+class TestMergingPressWithAdaKV:
+    """Tests for MergingPress wrapping AdaKVPress (mask-based path)."""
+
+    def test_accepts_adakv(self):
+        from kvpress import AdaKVPress
+        press = MergingPress(AdaKVPress(KnormPress(compression_ratio=0.5)))
+        assert press.compression_ratio == 0.5
+
+    def test_rejects_non_base_press(self):
+        with pytest.raises(AssertionError, match="requires a BasePress"):
+            MergingPress(press="not_a_press")
+
+    def test_compression_ratio_delegation(self):
+        from kvpress import AdaKVPress
+        inner = KnormPress(compression_ratio=0.3)
+        press = MergingPress(AdaKVPress(inner))
+        assert press.compression_ratio == 0.3
+        press.compression_ratio = 0.6
+        assert inner.compression_ratio == 0.6
+
+    def test_runs_with_model_and_sets_mask(self, unit_test_model):  # noqa: F811
+        from kvpress import AdaKVPress
+        press = MergingPress(AdaKVPress(KnormPress(compression_ratio=0.5)))
+        with press(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+            unit_test_model(input_ids, past_key_values=DynamicCache())
+
+        attn = unit_test_model.model.layers[0].self_attn
+        assert attn.masked_key_indices is not None, "masked_key_indices not set"
+
+    def test_merge_differs_from_plain_adakv(self, unit_test_model):  # noqa: F811
+        """MergingPress(AdaKV) should modify values compared to plain AdaKV."""
+        from kvpress import AdaKVPress
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        # Plain AdaKV
+        adakv = AdaKVPress(press=KnormPress(compression_ratio=0.5))
+        with adakv(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        # MergingPress(AdaKV)
+        merging = MergingPress(AdaKVPress(KnormPress(compression_ratio=0.5)))
+        with merging(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        any_different = any(
+            not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values)
+            for i in range(len(cache_plain.layers))
+        )
+        assert any_different, "MergingPress(AdaKV) should produce different values from plain AdaKV"
+
+    def test_zero_compression_is_identity(self, unit_test_model):  # noqa: F811
+        from kvpress import AdaKVPress
+        press = MergingPress(AdaKVPress(KnormPress(compression_ratio=0.0)))
+        with press(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+            assert cache.get_seq_length() == 64

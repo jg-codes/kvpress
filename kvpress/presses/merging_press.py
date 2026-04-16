@@ -190,51 +190,56 @@ def _merge_on_evict(
 @dataclass
 class MergingPress(BasePress):
     """
-    Scorer-agnostic merge-on-evict wrapper for KV cache compression during prefill.
+    Press-agnostic merge-on-evict wrapper for KV cache compression during prefill.
 
-    Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
+    Wraps any :class:`BasePress` and replaces hard eviction with merge-on-evict:
     each evicted token is folded into its most similar surviving neighbor rather than
     being discarded.  Values are blended via a similarity-weighted average; keys can
     optionally be merged or left unchanged depending on the ``merge_keys`` flag.
 
-    The scoring is delegated entirely to the wrapped press; only the eviction step
-    changes.  This makes the wrapper composable with all existing scorers.
+    **Composition modes:**
 
+    * ``MergingPress(ScorerPress)``: calls ``.score()``, applies uniform per-head
+      budget, returns truncated tensors with merged survivors.
+    * ``MergingPress(AdaKVPress(ScorerPress))``: delegates to AdaKV's adaptive
+      per-head budget allocation, then merges evicted tokens into survivors in-place.
+      Returns full-length tensors with ``masked_key_indices`` set.
+    * ``MergingPress(CriticalAdaKVPress(...))``: same pattern — any mask-based press.
+
+    For any non-ScorerPress inner press, MergingPress delegates ``.compress()`` to
+    the inner press, reads back ``module.masked_key_indices``, and merges evicted
+    tokens into their nearest cosine-similar survivors.
 
     Parameters
     ----------
-    press : ScorerPress
-        The underlying scoring method whose scores determine which tokens survive.
+    press : BasePress
+        The underlying press.  Can be a :class:`ScorerPress` for uniform merge,
+        or a mask-based press like :class:`AdaKVPress` / :class:`CriticalAdaKVPress`
+        for adaptive per-head merge.
     similarity_threshold : float, default=0.0
         Minimum cosine similarity between an evicted key and its nearest survivor
         for the merge to proceed.  Evicted tokens below this threshold are dropped
-        without merging.  Because cosine similarity can be negative, ``threshold=0.0``
-        still drops tokens whose keys point in the opposite direction of all survivors.
+        without merging.
     merge_keys : bool, default=False
         Whether to merge evicted information into kept keys.  When ``False`` (default),
         only values are merged — kept keys are returned unchanged.  This preserves
-        RoPE positional encoding in the keys.  Empirically, ``merge_keys=True`` hurts
-        quality on RoPE models (−2.5 pp on RULER-4096 with Qwen3-8B at CR=0.75).
+        RoPE positional encoding in the keys.
     value_norm_weighting : bool, default=True
         When ``True`` (default), the merge weight for each evicted token is additionally
-        scaled by the relative L2 norm of its value vector.  This allocates more merge
-        budget to evicted tokens that carry high-magnitude value content.  Empirically,
-        this improves accuracy by ~1.9 pp on RULER-4096.
+        scaled by the relative L2 norm of its value vector.
     max_merge_per_token : int, default=0
         Maximum number of evicted tokens merged into any single survivor before
-        weight scaling kicks in.  ``0`` (default) disables the cap.  When set,
-        survivors that receive more merges than the cap have each inbound weight
-        scaled down proportionally, preventing dilution of high-importance tokens.
+        weight scaling kicks in.  ``0`` (default) disables the cap.
     """
 
-    press: ScorerPress
+    press: BasePress
     similarity_threshold: float = 0.0
     merge_keys: bool = False
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
 
     def __post_init__(self):
-        assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
+        assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
 
@@ -262,24 +267,51 @@ class MergingPress(BasePress):
             return keys, values
 
         bsz, num_key_value_heads, k_len, head_dim = keys.shape
-        scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
 
-        n_kept = int(k_len * (1 - self.press.compression_ratio))
-        if n_kept >= k_len:
+        # --- ScorerPress path: uniform per-head merge, returns truncated tensors ---
+        if isinstance(self.press, ScorerPress):
+            scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
+            n_kept = int(k_len * (1 - self.press.compression_ratio))
+            if n_kept >= k_len:
+                return keys, values
+            if n_kept <= 0:
+                return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
+
+            return _merge_on_evict(
+                keys,
+                values,
+                scores,
+                n_kept,
+                self.similarity_threshold,
+                self.merge_keys,
+                self.value_norm_weighting,
+                self.max_merge_per_token,
+            )
+
+        # --- Mask-based press path (AdaKV, CriticalAdaKV, etc.) ---
+        # Delegate to the inner press which sets module.masked_key_indices
+        # and returns keys/values unchanged.
+        keys, values = self.press.compress(module, hidden_states, keys, values, attentions, kwargs)
+
+        mask_indices = getattr(module, "masked_key_indices", None)
+        if mask_indices is None:
             return keys, values
-        if n_kept <= 0:
-            return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
 
-        return _merge_on_evict(
+        # Build boolean eviction mask from (batch, head, seq) index tuple
+        evict_mask = torch.zeros(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
+        evict_mask[mask_indices] = True
+
+        # Merge evicted tokens into their nearest cosine-similar survivors
+        new_keys, new_values = _merge_on_evict_adaptive(
             keys,
             values,
-            scores,
-            n_kept,
+            evict_mask,
             self.similarity_threshold,
             self.merge_keys,
             self.value_norm_weighting,
             self.max_merge_per_token,
         )
+        return new_keys, new_values
 
 
 @dataclass
@@ -357,3 +389,125 @@ class MergingDecodingPress(DecodingPress):
             self.value_norm_weighting,
             self.max_merge_per_token,
         )
+
+
+def _merge_on_evict_adaptive(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    evict_mask: torch.Tensor,
+    similarity_threshold: float,
+    merge_keys: bool,
+    value_norm_weighting: bool,
+    max_merge_per_token: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Merge-on-evict with variable per-head eviction counts for :class:`MergingPress`.
+
+    Unlike :func:`_merge_on_evict` which uses a uniform ``n_kept`` across all KV heads,
+    this variant handles variable per-head eviction counts from AdaKV's global budget
+    allocation.  Each head may evict a different number of tokens; evicted tokens in each
+    head are merged into their nearest cosine-similar survivor independently.
+
+    The merged information is written **in-place** into the survivor positions of the
+    full-length tensors.  Evicted positions are left unchanged (they will be masked by
+    the attention patch via ``module.masked_key_indices``).
+
+    Parameters
+    ----------
+    keys : Tensor, shape ``(B, H, L, D)``
+    values : Tensor, shape ``(B, H, L, D)``
+    evict_mask : Tensor, shape ``(B, H, L)``, dtype bool
+        ``True`` at positions to evict, ``False`` at positions to keep.
+    similarity_threshold : float
+        Minimum cosine similarity for a merge to proceed.
+    merge_keys : bool
+        Whether to merge evicted information into survivor keys.
+    value_norm_weighting : bool
+        Scale merge weight by relative value-vector L2 norm.
+    max_merge_per_token : int, default=0
+        Cap on merges per survivor (0 = unlimited).
+
+    Returns
+    -------
+    tuple[Tensor, Tensor]
+        ``(new_keys, new_values)`` — same shape ``(B, H, L, D)`` as input.
+        Survivor positions contain merged information; evicted positions are unchanged.
+    """
+    bsz, num_kv_heads, k_len, head_dim = keys.shape
+    device = keys.device
+
+    # Work on float32 copies for numerical stability
+    merged_values = values.float().clone()
+    merged_keys = keys.float().clone() if merge_keys else None
+
+    # Iterate over (batch, head) — typically B=1, H=8 for Qwen3-8B = 8 iterations
+    for b in range(bsz):
+        for h in range(num_kv_heads):
+            evict_idx = evict_mask[b, h].nonzero(as_tuple=True)[0]
+            keep_idx = (~evict_mask[b, h]).nonzero(as_tuple=True)[0]
+            n_evict = evict_idx.shape[0]
+            n_kept = keep_idx.shape[0]
+
+            if n_evict == 0 or n_kept == 0:
+                continue
+
+            # Cosine similarity between evicted and kept keys
+            evict_k = keys[b, h, evict_idx].float()  # (n_e, D)
+            kept_k = keys[b, h, keep_idx].float()  # (n_k, D)
+
+            e_norms = evict_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+            k_norms = kept_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+            sim = (evict_k / e_norms) @ (kept_k / k_norms).T  # (n_e, n_k)
+            max_sim, target = sim.max(dim=-1)  # (n_e,)
+
+            # Threshold gate
+            merge_ok = max_sim >= similarity_threshold
+            if not merge_ok.any():
+                continue
+
+            # Merge weights
+            w = max_sim.clamp(min=0) * merge_ok.float()
+
+            if value_norm_weighting:
+                evict_v = values[b, h, evict_idx].float()
+                target_v = values[b, h, keep_idx[target]].float()
+                ev_norm = evict_v.norm(dim=-1)
+                tv_norm = target_v.norm(dim=-1)
+                w = w * ev_norm / (ev_norm + tv_norm + _EPS)
+
+            if max_merge_per_token > 0:
+                count = torch.zeros(n_kept, device=device, dtype=torch.float32)
+                count.scatter_add_(0, target, merge_ok.float())
+                excess = (count / max_merge_per_token).clamp(min=1.0)
+                w = w / excess[target]
+
+            # Scatter-add evicted values into survivors
+            w_exp = w.unsqueeze(-1)  # (n_e, 1)
+            evict_v = values[b, h, evict_idx].float()
+
+            val_accum = torch.zeros(n_kept, head_dim, device=device, dtype=torch.float32)
+            val_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_v), w_exp * evict_v)
+
+            w_accum = torch.zeros(n_kept, device=device, dtype=torch.float32)
+            w_accum.scatter_add_(0, target, w)
+
+            # Normalize: weighted average for active survivors
+            active = w_accum > 0
+            total_w = (1.0 + w_accum).unsqueeze(-1)
+
+            orig_v = merged_values[b, h, keep_idx]
+            new_v = (orig_v + val_accum) / total_w
+            merged_values[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_v, orig_v)
+
+            if merge_keys and merged_keys is not None:
+                evict_k_orig = keys[b, h, evict_idx].float()
+                key_accum = torch.zeros(n_kept, head_dim, device=device, dtype=torch.float32)
+                key_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_k_orig), w_exp * evict_k_orig)
+                orig_k = merged_keys[b, h, keep_idx]
+                new_k = (orig_k + key_accum) / total_w
+                merged_keys[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_k, orig_k)
+
+    result_values = merged_values.to(values.dtype)
+    result_keys = merged_keys.to(keys.dtype) if merge_keys else keys
+    return result_keys, result_values
+

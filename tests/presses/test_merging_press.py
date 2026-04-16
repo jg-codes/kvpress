@@ -425,3 +425,72 @@ class TestMergingPressWithAdaKV:
             cache = DynamicCache()
             unit_test_model(input_ids, past_key_values=cache)
             assert cache.get_seq_length() == 64
+
+
+class TestMergingPressWithDMS:
+    """Tests for MergingPress wrapping DMSPress (hook-based path)."""
+
+    def test_accepts_dms(self):
+        from kvpress import DMSPress, RandomPress
+        press = MergingPress(DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0))
+        assert press.threshold == -0.5
+
+    def test_is_hook_based(self):
+        from kvpress import DMSPress, RandomPress
+        press = MergingPress(DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0))
+        assert press._is_hook_based_press()
+
+    def test_scorer_is_not_hook_based(self):
+        press = MergingPress(KnormPress(compression_ratio=0.5))
+        assert not press._is_hook_based_press()
+
+    def test_threshold_passthrough(self):
+        from kvpress import DMSPress, RandomPress
+        dms = DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0)
+        press = MergingPress(dms)
+        assert press.threshold == -0.5
+        press.threshold = -3.0
+        assert dms.threshold == -3.0
+
+    def test_threshold_on_non_dms_raises(self):
+        press = MergingPress(KnormPress(compression_ratio=0.5))
+        with pytest.raises(AttributeError):
+            press.threshold = -1.0
+
+    def test_runs_with_model(self, unit_test_model):  # noqa: F811
+        from kvpress import DMSPress, RandomPress
+        torch.manual_seed(42)
+        dms = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
+        press = MergingPress(dms)
+        with press(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+
+        attn = unit_test_model.model.layers[0].self_attn
+        assert attn.masked_key_indices is not None, "masked_key_indices not set by DMSPress"
+
+    def test_merge_differs_from_plain_dms(self, unit_test_model):  # noqa: F811
+        """MergingPress(DMSPress) should produce different cache values from plain DMSPress."""
+        from kvpress import DMSPress, RandomPress
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+
+        # Plain DMSPress
+        dms_plain = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
+        with dms_plain(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        # MergingPress(DMSPress)
+        dms_merge = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
+        merging = MergingPress(dms_merge)
+        with merging(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        any_different = any(
+            not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values)
+            for i in range(len(cache_plain.layers))
+        )
+        assert any_different, "MergingPress(DMSPress) should produce different values from plain DMSPress"

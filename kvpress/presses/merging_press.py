@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from transformers import QuantizedCache
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.utils import extract_keys_and_values
 
 logger = logging.getLogger(__name__)
 
@@ -215,10 +217,14 @@ class MergingPress(BasePress):
       per-head budget allocation, then merges evicted tokens into survivors in-place.
       Returns full-length tensors with ``masked_key_indices`` set.
     * ``MergingPress(CriticalAdaKVPress(...))``: same pattern — any mask-based press.
+    * ``MergingPress(DMSPress(ScorerPress))``: delegates to DMSPress's threshold-based
+      eviction via its ``forward_hook``, then merges evicted tokens into survivors.
+      Combines content-adaptive compression with merge-on-evict.
 
-    For any non-ScorerPress inner press, MergingPress delegates ``.compress()`` to
-    the inner press, reads back ``module.masked_key_indices``, and merges evicted
-    tokens into their nearest cosine-similar survivors.
+    For compress-based inner presses, MergingPress delegates ``.compress()`` and reads
+    back ``module.masked_key_indices``.  For hook-based inner presses (like DMSPress)
+    that override ``forward_hook`` without implementing ``compress()``, MergingPress
+    delegates to the inner hook and then merges.
 
     Parameters
     ----------
@@ -266,6 +272,22 @@ class MergingPress(BasePress):
     def compression_ratio(self, value):
         self.press.compression_ratio = value
 
+    @property
+    def threshold(self):
+        """Passthrough to inner press threshold (e.g. DMSPress)."""
+        return getattr(self.press, "threshold", None)
+
+    @threshold.setter
+    def threshold(self, value):
+        if hasattr(self.press, "threshold"):
+            self.press.threshold = value
+        else:
+            raise AttributeError(f"Inner press {type(self.press).__name__} has no threshold attribute")
+
+    def _is_hook_based_press(self) -> bool:
+        """Check if the inner press uses forward_hook instead of compress."""
+        return type(self.press).compress is BasePress.compress and type(self.press).forward_hook is not BasePress.forward_hook
+
     def compress(
         self,
         module: nn.Module,
@@ -312,7 +334,7 @@ class MergingPress(BasePress):
 
         # Build boolean eviction mask from (batch, head, seq) index tuple
         evict_mask = torch.zeros(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
-        evict_mask[mask_indices] = True
+        evict_mask[tuple(mask_indices)] = True
 
         # Merge evicted tokens into their nearest cosine-similar survivors
         new_keys, new_values = _merge_on_evict_adaptive(
@@ -326,6 +348,64 @@ class MergingPress(BasePress):
             self.merge_fraction,
         )
         return new_keys, new_values
+
+    def forward_hook(self, module: nn.Module, input: list[torch.Tensor], kwargs: dict, output: list):
+        """Override to support hook-based inner presses (e.g. DMSPress).
+
+        For inner presses that implement their logic in ``forward_hook`` rather than
+        ``compress()`` (like DMSPress), we delegate to the inner hook first — letting it
+        score, accumulate, and set ``module.masked_key_indices`` — then merge evicted
+        tokens into their nearest cosine-similar survivors.
+
+        For all other inner presses, falls through to ``BasePress.forward_hook`` which
+        calls ``self.compress()``.
+        """
+        if not self._is_hook_based_press():
+            return super().forward_hook(module, input, kwargs, output)
+
+        # --- Hook-based press path (DMSPress, etc.) ---
+        # 1. Delegate to inner press hook: scores, accumulates, sets masks
+        output = self.press.forward_hook(module, input, kwargs, output)
+
+        # 2. Check if eviction happened this layer
+        mask_indices = getattr(module, "masked_key_indices", None)
+        if mask_indices is None or len(mask_indices[0]) == 0:
+            return output
+
+        # 3. Extract current keys/values from cache
+        cache = kwargs["past_key_values"]
+        keys, values = extract_keys_and_values(cache, module.layer_idx)
+        bsz, num_kv_heads, k_len, head_dim = keys.shape
+
+        # 4. Build boolean eviction mask from index tuple
+        evict_mask = torch.zeros(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+        evict_mask[tuple(mask_indices)] = True
+
+        # 5. Merge evicted tokens into survivors
+        new_keys, new_values = _merge_on_evict_adaptive(
+            keys,
+            values,
+            evict_mask,
+            self.similarity_threshold,
+            self.merge_keys,
+            self.value_norm_weighting,
+            self.max_merge_per_token,
+            self.merge_fraction,
+        )
+
+        # 6. Write merged values back to cache (evicted positions stay masked)
+        cache_layer = cache.layers[module.layer_idx]
+        if isinstance(cache, QuantizedCache):
+            cache_layer._quantized_keys = cache_layer._quantize(new_keys, axis=cache_layer.axis_key)
+            cache_layer._quantized_values = cache_layer._quantize(new_values, axis=cache_layer.axis_value)
+            cache_layer.keys = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.values = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.cumulative_length = new_keys.shape[2]
+        else:
+            cache_layer.keys = new_keys
+            cache_layer.values = new_values
+
+        return output
 
 
 @dataclass

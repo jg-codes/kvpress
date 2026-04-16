@@ -137,5 +137,8 @@ PRESS_REGISTRY = {
     "merging_adakv_snapkv": MergingPress(AdaKVPress(SnapKVPress())),
     "merging_adakv_knorm": MergingPress(AdaKVPress(KnormPress())),
     "merging_adakv_kvzap": MergingPress(AdaKVPress(KVzapPress(model_type="mlp"))),
+    # MergingPress(DMSPress(KVzapPress)): content-adaptive threshold + merge-on-evict
+    "merging_dms_kvzap_mlp": MergingPress(DMSPress(press=KVzapPress(model_type="mlp"))),
+    "merging_dms_kvzap_linear": MergingPress(DMSPress(press=KVzapPress(model_type="linear"))),
     "expected_attention_bare": ExpectedAttentionPress(epsilon=1e-2),
 }

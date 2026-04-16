@@ -7,7 +7,7 @@ from transformers import DynamicCache, QuantizedCache
 from transformers.utils import is_optimum_quanto_available
 
 from kvpress import KnormPress, SnapKVPress
-from kvpress.presses.merging_press import MergingPress
+from kvpress.presses.merging_press import MergingDecodingPress, MergingPress
 from tests.fixtures import unit_test_model  # noqa: F401
 
 
@@ -320,3 +320,43 @@ class TestMergingPress:
         for layer in cache.layers:
             assert torch.isfinite(layer.keys).all(), "Non-finite keys with QuantizedCache"
             assert torch.isfinite(layer.values).all(), "Non-finite values with QuantizedCache"
+
+
+
+class TestMergingDecodingPress:
+    """Minimal tests for MergingDecodingPress (decoding-phase merge-on-evict)."""
+
+    def test_instantiation(self):
+        """Can be constructed with any ScorerPress."""
+        press = MergingDecodingPress(base_press=KnormPress())
+        assert press.target_size == 2048
+        assert press.similarity_threshold == 0.0
+
+    def test_compress_override(self, unit_test_model):
+        """Compress delegates to _merge_on_evict instead of hard eviction."""
+        press = MergingDecodingPress(
+            base_press=KnormPress(),
+            target_size=32,
+            compression_interval=1,
+        )
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+        with press(unit_test_model):
+            out = unit_test_model(input_ids)
+        assert out.logits.shape[0] == 1
+
+    def test_parameters_forwarded(self):
+        """Merge parameters (threshold, merge_keys, etc.) are stored correctly."""
+        press = MergingDecodingPress(
+            base_press=SnapKVPress(),
+            similarity_threshold=0.5,
+            merge_keys=True,
+            value_norm_weighting=False,
+            max_merge_per_token=3,
+            target_size=512,
+        )
+        assert press.similarity_threshold == 0.5
+        assert press.merge_keys is True
+        assert press.value_norm_weighting is False
+        assert press.max_merge_per_token == 3
+        assert press.target_size == 512

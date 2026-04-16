@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from kvpress.presses.base_press import BasePress
+from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.scorer_press import ScorerPress
 
 logger = logging.getLogger(__name__)
@@ -268,6 +269,83 @@ class MergingPress(BasePress):
             return keys, values
         if n_kept <= 0:
             return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
+
+        return _merge_on_evict(
+            keys,
+            values,
+            scores,
+            n_kept,
+            self.similarity_threshold,
+            self.merge_keys,
+            self.value_norm_weighting,
+            self.max_merge_per_token,
+        )
+
+
+@dataclass
+class MergingDecodingPress(DecodingPress):
+    """
+    Merge-on-evict KV cache compression during decoding.
+
+    Extends :class:`DecodingPress` with the same merge-on-evict strategy used by
+    :class:`MergingPress`: instead of hard-pruning low-scoring tokens, their key/value
+    vectors are folded into the most cosine-similar survivor.  All decoding-phase
+    scheduling (buffered hidden states, interval-based triggering) is inherited from
+    ``DecodingPress``.
+
+    Compared to :class:`CAMPress`, which merges into *sequential neighbors* using a
+    Bernoulli mask derived from cumulative attention, ``MergingDecodingPress`` merges
+    into the *most similar survivor* using cosine similarity — making it
+    position-agnostic and compatible with any :class:`ScorerPress`.
+
+    Parameters
+    ----------
+    base_press : ScorerPress
+        Scorer used to rank tokens for eviction.
+    compression_interval : int, default=512
+        Decoding steps between compression passes.
+    target_size : int, default=2048
+        Number of tokens to keep after each compression.
+    hidden_states_buffer_size : int, default=256
+        Maximum buffered hidden states for scoring context.
+    similarity_threshold : float, default=0.0
+        Minimum cosine similarity for a merge to proceed.
+    merge_keys : bool, default=False
+        Whether to merge evicted keys into survivors.  ``False`` (default)
+        preserves RoPE positional encoding.
+    value_norm_weighting : bool, default=True
+        Scale merge weight by relative value-vector L2 norm.
+    max_merge_per_token : int, default=0
+        Maximum merges per survivor.  ``0`` disables the cap.
+    """
+
+    similarity_threshold: float = 0.0
+    merge_keys: bool = False
+    value_norm_weighting: bool = True
+    max_merge_per_token: int = 0
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Override hard eviction with merge-on-evict during decoding."""
+        k_len = keys.shape[2]
+        n_kept = self.target_size
+
+        if k_len <= n_kept:
+            return keys, values
+
+        target_compression_ratio = self._find_target_compression_ratio(k_len, n_kept)
+
+        original_cr = self.base_press.compression_ratio
+        self.base_press.compression_ratio = target_compression_ratio
+        scores = self.base_press.score(module, hidden_states, keys, values, attentions, kwargs)
+        self.base_press.compression_ratio = original_cr
 
         return _merge_on_evict(
             keys,

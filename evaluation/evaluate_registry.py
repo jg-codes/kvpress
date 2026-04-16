@@ -136,5 +136,6 @@ PRESS_REGISTRY = {
     "merging_adakv_ea": MergingPress(AdaKVPress(ExpectedAttentionPress(epsilon=1e-2))),
     "merging_adakv_snapkv": MergingPress(AdaKVPress(SnapKVPress())),
     "merging_adakv_knorm": MergingPress(AdaKVPress(KnormPress())),
+    "merging_adakv_kvzap": MergingPress(AdaKVPress(KVzapPress(model_type="mlp"))),
     "expected_attention_bare": ExpectedAttentionPress(epsilon=1e-2),
 }

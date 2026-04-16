@@ -10,7 +10,6 @@ Presses tested:
   - kvzap_mlp_layer      : AdaKVPress(KVzapPress(mlp))        — adaptive per-layer
   - merging_kvzap_mlp    : MergingPress(KVzapPress(mlp))      — uniform merge
   - merging_adakv_kvzap  : MergingPress(AdaKVPress(KVzapPress))— adaptive merge
-  - kvzap_mlp            : DMSPress(KVzapPress(mlp))          — DMS wrapping (leaderboard)
   - merging_adakv_ea     : MergingPress(AdaKVPress(EA))        — best from prior run
   - merging_adakv_snapkv : MergingPress(AdaKVPress(SnapKV))
   - merging_adakv_knorm  : MergingPress(AdaKVPress(Knorm))
@@ -49,7 +48,8 @@ image = (
         "tqdm",
         "accelerate",
     )
-    .pip_install(f"kvpress @ git+https://github.com/jg-codes/kvpress.git@{BRANCH}")
+    # Cache-buster: force rebuild after KVzapConfig fix (commit 9d87756)
+    .run_commands(f"pip install --no-cache-dir 'kvpress @ git+https://github.com/jg-codes/kvpress.git@{BRANCH}'")
     .pip_install("jieba", "bert_score", "fuzzywuzzy", "python-Levenshtein", "nltk", "rouge")
     # skorch + sklearn for KVzap MLP surrogate
     .pip_install("skorch", "scikit-learn")
@@ -73,7 +73,6 @@ PRESSES = [
     "kvzap_mlp_layer",        # AdaKVPress(KVzapPress(mlp)) — adaptive per-layer budget
     "merging_kvzap_mlp",      # MergingPress(KVzapPress(mlp)) — uniform merge-on-evict
     "merging_adakv_kvzap",    # MergingPress(AdaKVPress(KVzapPress(mlp))) — adaptive merge
-    "kvzap_mlp",              # DMSPress(KVzapPress(mlp)) — leaderboard DMS variant
     # MergingPress(AdaKV) compositions (other scorers for comparison)
     "merging_adakv_ea",       # MergingPress(AdaKVPress(ExpectedAttentionPress))
     "merging_adakv_snapkv",   # MergingPress(AdaKVPress(SnapKVPress))
@@ -204,7 +203,7 @@ def main(fraction: float = 0.05):
         print(f"{label:<55} {r['mean']:>6.1f}  {r['n_tasks']:>3}")
 
     # ── Per-task breakdown for KVzap variants ──────────────────────────
-    kvzap_presses = ["kvzap_mlp_head", "kvzap_mlp_layer", "merging_kvzap_mlp", "merging_adakv_kvzap", "kvzap_mlp"]
+    kvzap_presses = ["kvzap_mlp_head", "kvzap_mlp_layer", "merging_kvzap_mlp", "merging_adakv_kvzap"]
     all_tasks = set()
     for label, r in table.items():
         all_tasks.update(r.get("per_task", {}).keys())
@@ -231,20 +230,18 @@ def main(fraction: float = 0.05):
     print(f"\n{'='*80}")
     print("KVzap Wrapping Comparison")
     print(f"{'-'*80}")
-    print(f"  {'CR':>5} {'Bare':>8} {'AdaKV':>8} {'Merging':>8} {'M(AdaKV)':>9} {'DMS':>8} | {'M(A) vs Bare':>13} {'M(A) vs DMS':>12}")
+    print(f"  {'CR':>5} {'Bare':>8} {'AdaKV':>8} {'Merging':>8} {'M(AdaKV)':>9} | {'M(A) vs Bare':>13}")
     for cr in CRS:
         bare = table.get(f"kvzap_mlp_head (cr={cr:.3f})", {}).get("mean")
         adakv = table.get(f"kvzap_mlp_layer (cr={cr:.3f})", {}).get("mean")
         merge = table.get(f"merging_kvzap_mlp (cr={cr:.3f})", {}).get("mean")
         m_adakv = table.get(f"merging_adakv_kvzap (cr={cr:.3f})", {}).get("mean")
-        dms = table.get(f"kvzap_mlp (cr={cr:.3f})", {}).get("mean")
 
         def fmt(v):
             return f"{v:.1f}" if v is not None else "—"
 
         d_bare = f"{m_adakv - bare:+.1f}" if m_adakv is not None and bare is not None else "—"
-        d_dms = f"{m_adakv - dms:+.1f}" if m_adakv is not None and dms is not None else "—"
-        print(f"  {cr:>5.3f} {fmt(bare):>8} {fmt(adakv):>8} {fmt(merge):>8} {fmt(m_adakv):>9} {fmt(dms):>8} | {d_bare:>13} {d_dms:>12}")
+        print(f"  {cr:>5.3f} {fmt(bare):>8} {fmt(adakv):>8} {fmt(merge):>8} {fmt(m_adakv):>9} | {d_bare:>13}")
 
     # ── Cross-scorer comparison at CR=0.50 ─────────────────────────────
     print(f"\n{'='*80}")

@@ -187,6 +187,115 @@ def _merge_on_evict(
     return merged_keys.contiguous(), merged_values.contiguous()
 
 
+def _merge_on_evict_adaptive(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    evict_mask: torch.Tensor,
+    similarity_threshold: float,
+    merge_keys: bool,
+    value_norm_weighting: bool,
+    max_merge_per_token: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Merge-on-evict with variable per-head eviction counts.
+
+    Unlike :func:`_merge_on_evict` which uses a uniform ``n_kept`` across all KV heads,
+    this variant handles variable per-head eviction counts from adaptive budget
+    allocation (AdaKV, DMSPress).  Each head may evict a different number of tokens.
+
+    The merged information is written **in-place** into the survivor positions of the
+    full-length tensors.  Evicted positions are left unchanged (they will be masked by
+    the attention patch via ``module.masked_key_indices``).
+
+    Parameters
+    ----------
+    keys : Tensor, shape ``(B, H, L, D)``
+    values : Tensor, shape ``(B, H, L, D)``
+    evict_mask : Tensor, shape ``(B, H, L)``, dtype bool
+        ``True`` at positions to evict, ``False`` at positions to keep.
+    similarity_threshold : float
+    merge_keys : bool
+    value_norm_weighting : bool
+    max_merge_per_token : int, default=0
+
+    Returns
+    -------
+    tuple[Tensor, Tensor]
+        ``(new_keys, new_values)`` — same shape as input.
+    """
+    bsz, num_kv_heads, k_len, head_dim = keys.shape
+    device = keys.device
+
+    merged_values = values.float().clone()
+    merged_keys = keys.float().clone() if merge_keys else None
+
+    for b in range(bsz):
+        for h in range(num_kv_heads):
+            evict_idx = evict_mask[b, h].nonzero(as_tuple=True)[0]
+            keep_idx = (~evict_mask[b, h]).nonzero(as_tuple=True)[0]
+            n_evict = evict_idx.shape[0]
+            n_kept = keep_idx.shape[0]
+
+            if n_evict == 0 or n_kept == 0:
+                continue
+
+            evict_k = keys[b, h, evict_idx].float()
+            kept_k = keys[b, h, keep_idx].float()
+
+            e_norms = evict_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+            k_norms = kept_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
+            sim = (evict_k / e_norms) @ (kept_k / k_norms).T
+            max_sim, target = sim.max(dim=-1)
+
+            merge_ok = max_sim >= similarity_threshold
+
+            if not merge_ok.any():
+                continue
+
+            w = max_sim.clamp(min=0) * merge_ok.float()
+
+            if value_norm_weighting:
+                evict_v = values[b, h, evict_idx].float()
+                target_v = values[b, h, keep_idx[target]].float()
+                ev_norm = evict_v.norm(dim=-1)
+                tv_norm = target_v.norm(dim=-1)
+                w = w * ev_norm / (ev_norm + tv_norm + _EPS)
+
+            if max_merge_per_token > 0:
+                count = torch.zeros(n_kept, device=device, dtype=torch.float32)
+                count.scatter_add_(0, target, merge_ok.float())
+                excess = (count / max_merge_per_token).clamp(min=1.0)
+                w = w / excess[target]
+
+            w_exp = w.unsqueeze(-1)
+            evict_v = values[b, h, evict_idx].float()
+
+            val_accum = torch.zeros(n_kept, head_dim, device=device, dtype=torch.float32)
+            val_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_v), w_exp * evict_v)
+
+            w_accum = torch.zeros(n_kept, device=device, dtype=torch.float32)
+            w_accum.scatter_add_(0, target, w)
+
+            active = w_accum > 0
+            total_w = (1.0 + w_accum).unsqueeze(-1)
+
+            orig_v = merged_values[b, h, keep_idx]
+            new_v = (orig_v + val_accum) / total_w
+            merged_values[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_v, orig_v)
+
+            if merge_keys and merged_keys is not None:
+                evict_k_orig = keys[b, h, evict_idx].float()
+                key_accum = torch.zeros(n_kept, head_dim, device=device, dtype=torch.float32)
+                key_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_k_orig), w_exp * evict_k_orig)
+                orig_k = merged_keys[b, h, keep_idx]
+                new_k = (orig_k + key_accum) / total_w
+                merged_keys[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_k, orig_k)
+
+    result_values = merged_values.to(values.dtype)
+    result_keys = merged_keys.to(keys.dtype) if merge_keys else keys
+    return result_keys, result_values
+
+
 @dataclass
 class MergingPress(BasePress):
     """

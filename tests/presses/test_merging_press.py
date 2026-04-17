@@ -6,7 +6,7 @@ import torch
 from transformers import DynamicCache, QuantizedCache
 from transformers.utils import is_optimum_quanto_available
 
-from kvpress import AdaKVPress, KnormPress, SnapKVPress
+from kvpress import AdaKVPress, DMSPress, KnormPress, RandomPress, SnapKVPress
 from kvpress.presses.merging_press import MergingDecodingPress, MergingPress
 from tests.fixtures import unit_test_model  # noqa: F401
 
@@ -418,3 +418,66 @@ class TestMergingPressWithAdaKV:
             cache = DynamicCache()
             unit_test_model(input_ids, past_key_values=cache)
         assert cache.get_seq_length() == 64
+
+
+class TestMergingPressWithDMS:
+    """Tests for MergingPress wrapping DMSPress (hook-based composition)."""
+
+    def test_accepts_dms(self):
+        dms = DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0)
+        press = MergingPress(press=dms)
+        assert press.press is dms
+
+    def test_is_hook_based(self):
+        dms = DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0)
+        press = MergingPress(press=dms)
+        assert press._is_hook_based_press()
+
+    def test_scorer_is_not_hook_based(self):
+        press = MergingPress(press=KnormPress(compression_ratio=0.5))
+        assert not press._is_hook_based_press()
+
+    def test_threshold_passthrough(self):
+        dms = DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0)
+        press = MergingPress(press=dms)
+        assert press.threshold == -0.5
+        press.threshold = -3
+        assert dms.threshold == -3
+
+    def test_threshold_on_non_dms_raises(self):
+        press = MergingPress(press=KnormPress(compression_ratio=0.5))
+        with pytest.raises(AttributeError, match="threshold only applies"):
+            press.threshold = -4
+
+    def test_runs_with_model(self, unit_test_model):  # noqa: F811
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+        dms = DMSPress(press=RandomPress(), threshold=-0.5, sliding_window_size=0)
+        wrapper = MergingPress(press=dms, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+        assert cache.get_seq_length() > 0
+
+    def test_merge_differs_from_plain_dms(self, unit_test_model):  # noqa: F811
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+
+        # threshold=0.5 ensures RandomPress (scores ~0-1) evicts ~half of tokens
+        plain = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
+        with plain(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        dms2 = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
+        wrapper = MergingPress(press=dms2, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        any_different = False
+        for i in range(len(cache_plain.layers)):
+            if not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values):
+                any_different = True
+                break
+        assert any_different, "MergingPress(DMSPress) should produce different values than plain DMSPress"

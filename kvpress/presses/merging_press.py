@@ -382,8 +382,22 @@ class MergingPress(BasePress):
         if isinstance(self.press, ScorerPress):
             return self._compress_scorer(module, hidden_states, keys, values, attentions, kwargs)
 
-        # Other press types (AdaKV, etc.) handled in follow-up commits
-        return keys, values
+        # --- Mask-based press path (AdaKV, CriticalAdaKV, etc.) ---
+        keys, values = self.press.compress(module, hidden_states, keys, values, attentions, kwargs)
+
+        mask_indices = getattr(module, "masked_key_indices", None)
+        if mask_indices is None:
+            return keys, values
+
+        evict_mask = torch.zeros(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
+        evict_mask[tuple(mask_indices)] = True
+
+        new_keys, new_values = _merge_on_evict_adaptive(
+            keys, values, evict_mask,
+            self.similarity_threshold, self.merge_keys,
+            self.value_norm_weighting, self.max_merge_per_token,
+        )
+        return new_keys, new_values
 
     def _compress_scorer(self, module, hidden_states, keys, values, attentions, kwargs):
         bsz, num_key_value_heads, k_len, head_dim = keys.shape

@@ -6,7 +6,7 @@ import torch
 from transformers import DynamicCache, QuantizedCache
 from transformers.utils import is_optimum_quanto_available
 
-from kvpress import KnormPress, SnapKVPress
+from kvpress import AdaKVPress, KnormPress, SnapKVPress
 from kvpress.presses.merging_press import MergingDecodingPress, MergingPress
 from tests.fixtures import unit_test_model  # noqa: F401
 
@@ -360,3 +360,61 @@ class TestMergingDecodingPress:
         assert press.value_norm_weighting is False
         assert press.max_merge_per_token == 3
         assert press.target_size == 512
+
+
+class TestMergingPressWithAdaKV:
+    """Tests for MergingPress wrapping AdaKVPress (mask-based composition)."""
+
+    def test_accepts_adakv(self):
+        press = MergingPress(press=AdaKVPress(SnapKVPress()))
+        assert press.press is not None
+
+    def test_rejects_non_base_press(self):
+        with pytest.raises(AssertionError, match="requires a BasePress"):
+            MergingPress(press="not_a_press")
+
+    def test_compression_ratio_delegation(self):
+        inner = AdaKVPress(SnapKVPress())
+        wrapper = MergingPress(press=inner)
+        wrapper.compression_ratio = 0.3
+        assert inner.compression_ratio == 0.3
+
+    def test_runs_with_model_and_sets_mask(self, unit_test_model):  # noqa: F811
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+        inner = AdaKVPress(SnapKVPress(compression_ratio=0.5))
+        wrapper = MergingPress(press=inner, similarity_threshold=0.0)
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+        assert cache.get_seq_length() == 128  # full-length (mask-based, not truncated)
+
+    def test_merge_differs_from_plain_adakv(self, unit_test_model):  # noqa: F811
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+
+        plain = AdaKVPress(SnapKVPress(compression_ratio=0.5))
+        with plain(unit_test_model):
+            cache_plain = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+
+        wrapper = MergingPress(press=AdaKVPress(SnapKVPress(compression_ratio=0.5)))
+        with wrapper(unit_test_model):
+            cache_merge = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_merge)
+
+        any_different = False
+        for i in range(len(cache_plain.layers)):
+            if not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values):
+                any_different = True
+                break
+        assert any_different, "MergingPress(AdaKV) should produce different values than plain AdaKV"
+
+    def test_zero_compression_is_identity(self, unit_test_model):  # noqa: F811
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+        wrapper = MergingPress(press=AdaKVPress(SnapKVPress(compression_ratio=0.0)))
+        with wrapper(unit_test_model):
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+        assert cache.get_seq_length() == 64

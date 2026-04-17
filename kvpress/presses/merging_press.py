@@ -30,6 +30,7 @@ def _merge_on_evict(
     value_norm_weighting: bool,
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
+    perturbation_gate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Core merge-on-evict kernel for :class:`MergingPress`.
@@ -135,6 +136,13 @@ def _merge_on_evict(
         q = 1.0 - merge_fraction
         frac_threshold = masked_sim.quantile(q, dim=-1, keepdim=True)
         merge_mask = merge_mask & (max_sim >= frac_threshold)
+
+    # --- Perturbation-bound gate: skip merges with high estimated error ---
+    # bound_i = ‖v_i‖ * (1 - w) / (1 + w)  where w = cosine similarity
+    if perturbation_gate > 0 and merge_mask.any():
+        evict_v_norms = evict_values.float().norm(dim=-1)  # (B, H, n_evict)
+        error_bound = evict_v_norms * (1 - max_sim) / (1 + max_sim + _EPS)
+        merge_mask = merge_mask & (error_bound <= perturbation_gate)
 
     if not merge_mask.any():
         return kept_keys.contiguous(), kept_values.contiguous()
@@ -246,6 +254,13 @@ class MergingPress(BasePress):
     max_merge_per_token : int, default=0
         Maximum number of evicted tokens merged into any single survivor before
         weight scaling kicks in.  ``0`` (default) disables the cap.
+    perturbation_gate : float, default=0.0
+        Maximum per-merge perturbation bound for a merge to proceed.  For each
+        evicted token *i* routed to survivor *j* with cosine similarity *w*, the
+        bound is :math:`\\|v_i\\| \\cdot (1 - w) / (1 + w)`.  Merges exceeding
+        this threshold are skipped (hard-evicted instead).  ``0.0`` disables the
+        gate.  Useful for preventing regressions on exact-match tasks (e.g. QA)
+        where high-norm answer tokens should not be blended into context survivors.
     """
 
     press: BasePress
@@ -254,12 +269,14 @@ class MergingPress(BasePress):
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
+    perturbation_gate: float = 0.0
 
     def __post_init__(self):
         assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
+        assert self.perturbation_gate >= 0.0, "perturbation_gate must be non-negative"
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -321,6 +338,7 @@ class MergingPress(BasePress):
                 self.value_norm_weighting,
                 self.max_merge_per_token,
                 self.merge_fraction,
+                self.perturbation_gate,
             )
 
         # --- Mask-based press path (AdaKV, CriticalAdaKV, etc.) ---
@@ -346,6 +364,7 @@ class MergingPress(BasePress):
             self.value_norm_weighting,
             self.max_merge_per_token,
             self.merge_fraction,
+            self.perturbation_gate,
         )
         return new_keys, new_values
 
@@ -391,6 +410,7 @@ class MergingPress(BasePress):
             self.value_norm_weighting,
             self.max_merge_per_token,
             self.merge_fraction,
+            self.perturbation_gate,
         )
 
         # 6. Write merged values back to cache (evicted positions stay masked)
@@ -443,6 +463,8 @@ class MergingDecodingPress(DecodingPress):
         Scale merge weight by relative value-vector L2 norm.
     max_merge_per_token : int, default=0
         Maximum merges per survivor.  ``0`` disables the cap.
+    perturbation_gate : float, default=0.0
+        Maximum per-merge perturbation bound.  See :class:`MergingPress`.
     """
 
     similarity_threshold: float = 0.0
@@ -450,6 +472,7 @@ class MergingDecodingPress(DecodingPress):
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
+    perturbation_gate: float = 0.0
 
     def compress(
         self,
@@ -484,6 +507,7 @@ class MergingDecodingPress(DecodingPress):
             self.value_norm_weighting,
             self.max_merge_per_token,
             self.merge_fraction,
+            self.perturbation_gate,
         )
 
 
@@ -496,6 +520,7 @@ def _merge_on_evict_adaptive(
     value_norm_weighting: bool,
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
+    perturbation_gate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Merge-on-evict with variable per-head eviction counts for :class:`MergingPress`.
@@ -567,6 +592,12 @@ def _merge_on_evict_adaptive(
                 q = 1.0 - merge_fraction
                 frac_threshold = masked_sim.quantile(q)
                 merge_ok = merge_ok & (max_sim >= frac_threshold)
+
+            # Perturbation-bound gate: skip merges with high estimated error
+            if perturbation_gate > 0 and merge_ok.any():
+                evict_v_norms = values[b, h, evict_idx].float().norm(dim=-1)
+                error_bound = evict_v_norms * (1 - max_sim) / (1 + max_sim + _EPS)
+                merge_ok = merge_ok & (error_bound <= perturbation_gate)
 
             if not merge_ok.any():
                 continue

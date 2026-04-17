@@ -282,6 +282,65 @@ class TestMergingPress:
                 break
         assert any_different, "max_merge_per_token=1 should differ from uncapped"
 
+    def test_perturbation_gate_zero_disabled(self, unit_test_model):  # noqa: F811
+        """perturbation_gate=0.0 should produce identical output to default (gate disabled)."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_default = MergingPress(press=base1, similarity_threshold=0.0)
+        with wrap_default(unit_test_model):
+            cache_default = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_default)
+
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_gated = MergingPress(press=base2, similarity_threshold=0.0, perturbation_gate=0.0)
+        with wrap_gated(unit_test_model):
+            cache_gated = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_gated)
+
+        for i in range(len(cache_default.layers)):
+            assert torch.equal(cache_default.layers[i].values, cache_gated.layers[i].values), (
+                f"perturbation_gate=0.0 should be identical to default at layer {i}"
+            )
+
+    def test_perturbation_gate_blocks_high_error(self, unit_test_model):  # noqa: F811
+        """A very tight perturbation_gate should block most merges, approaching hard eviction."""
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+
+        # No gate — merges freely
+        base1 = KnormPress(compression_ratio=0.5)
+        wrap_free = MergingPress(press=base1, similarity_threshold=0.0)
+        with wrap_free(unit_test_model):
+            cache_free = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_free)
+
+        # Hard eviction (no merging) — similarity_threshold=1.0 blocks all merges
+        base2 = KnormPress(compression_ratio=0.5)
+        wrap_hard = MergingPress(press=base2, similarity_threshold=1.0)
+        with wrap_hard(unit_test_model):
+            cache_hard = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_hard)
+
+        # Tight perturbation gate — should block high-error merges
+        base3 = KnormPress(compression_ratio=0.5)
+        wrap_tight = MergingPress(press=base3, similarity_threshold=0.0, perturbation_gate=1e-6)
+        with wrap_tight(unit_test_model):
+            cache_tight = DynamicCache()
+            unit_test_model(input_ids.clone(), past_key_values=cache_tight)
+
+        # tight gate should be closer to hard eviction than to free merging
+        diff_free = 0.0
+        diff_hard = 0.0
+        for i in range(len(cache_tight.layers)):
+            diff_free += (cache_tight.layers[i].values - cache_free.layers[i].values).abs().sum().item()
+            diff_hard += (cache_tight.layers[i].values - cache_hard.layers[i].values).abs().sum().item()
+        assert diff_hard < diff_free, (
+            f"Tight perturbation gate should produce results closer to hard eviction "
+            f"(diff_hard={diff_hard:.4f}) than free merging (diff_free={diff_free:.4f})"
+        )
+
     def test_high_compression_short_sequence(self, unit_test_model):  # noqa: F811
         """Very high compression on a short sequence must not crash."""
         torch.manual_seed(42)

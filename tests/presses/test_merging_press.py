@@ -481,3 +481,47 @@ class TestMergingPressWithDMS:
                 any_different = True
                 break
         assert any_different, "MergingPress(DMSPress) should produce different values than plain DMSPress"
+
+
+class TestPerturbationGate:
+    """Tests for the perturbation_gate parameter."""
+
+    def test_perturbation_gate_blocks_high_error(self, unit_test_model):
+        """A very tight gate should block most merges, making output closer to hard eviction."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 2, 32, 16
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D) * 10  # high-norm values → high error bound
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        # No gate → merges happen freely
+        k_free, v_free = _merge_on_evict(keys, values, scores, n_kept, 0.0, False, True)
+        # Tight gate → most merges blocked (bound = ‖v‖*(1-w)/(1+w) >> 0.001)
+        k_gated, v_gated = _merge_on_evict(keys, values, scores, n_kept, 0.0, False, True,
+                                            perturbation_gate=0.001)
+        # Hard eviction baseline (threshold=1.0 blocks all merges)
+        k_hard, v_hard = _merge_on_evict(keys, values, scores, n_kept, 1.0, False, True)
+
+        # Gated output should be closer to hard eviction than free merge
+        diff_gated = (v_gated - v_hard).norm()
+        diff_free = (v_free - v_hard).norm()
+        assert diff_gated < diff_free, "Tight perturbation gate should produce output closer to hard eviction"
+
+    def test_perturbation_gate_zero_disabled(self):
+        """perturbation_gate=0.0 should have no effect (backward compat)."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 2, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        torch.manual_seed(42)  # ensure same random state
+        k1, v1 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True)
+        k2, v2 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True,
+                                  perturbation_gate=0.0)
+        assert torch.equal(v1, v2), "perturbation_gate=0.0 should produce identical output to default"

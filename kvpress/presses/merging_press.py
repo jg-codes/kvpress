@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from transformers import QuantizedCache
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.utils import extract_keys_and_values
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +364,28 @@ class MergingPress(BasePress):
 
     @compression_ratio.setter
     def compression_ratio(self, value):
+        from kvpress.presses.dms_press import DMSPress
+
+        if isinstance(self.press, DMSPress):
+            raise AttributeError("compression_ratio cannot be set when wrapping DMSPress; set threshold instead")
         self.press.compression_ratio = value
+
+    @property
+    def threshold(self):
+        from kvpress.presses.dms_press import DMSPress
+
+        if isinstance(self.press, DMSPress):
+            return self.press.threshold
+        return None
+
+    @threshold.setter
+    def threshold(self, value):
+        from kvpress.presses.dms_press import DMSPress
+
+        if isinstance(self.press, DMSPress):
+            self.press.threshold = value
+        else:
+            raise AttributeError("threshold only applies when wrapping DMSPress")
 
     def compress(
         self,
@@ -419,6 +442,54 @@ class MergingPress(BasePress):
             self.value_norm_weighting,
             self.max_merge_per_token,
         )
+
+    def _is_hook_based_press(self) -> bool:
+        """Check if inner press overrides forward_hook without implementing compress."""
+        return (type(self.press).compress is BasePress.compress
+                and type(self.press).forward_hook is not BasePress.forward_hook)
+
+    def forward_hook(self, module: nn.Module, input: list[torch.Tensor], kwargs: dict, output: list):
+        """Override to support hook-based inner presses (e.g. DMSPress)."""
+        if not self._is_hook_based_press():
+            return super().forward_hook(module, input, kwargs, output)
+
+        # 1. Delegate to inner press hook: scores, accumulates, sets masks
+        output = self.press.forward_hook(module, input, kwargs, output)
+
+        # 2. Check if eviction happened this layer
+        mask_indices = getattr(module, "masked_key_indices", None)
+        if mask_indices is None or len(mask_indices[0]) == 0:
+            return output
+
+        # 3. Extract current keys/values from cache
+        cache = kwargs["past_key_values"]
+        keys, values = extract_keys_and_values(cache, module.layer_idx)
+        bsz, num_kv_heads, k_len, head_dim = keys.shape
+
+        # 4. Build boolean eviction mask from index tuple
+        evict_mask = torch.zeros(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+        evict_mask[tuple(mask_indices)] = True
+
+        # 5. Merge evicted tokens into survivors
+        new_keys, new_values = _merge_on_evict_adaptive(
+            keys, values, evict_mask,
+            self.similarity_threshold, self.merge_keys,
+            self.value_norm_weighting, self.max_merge_per_token,
+        )
+
+        # 6. Write merged values back to cache
+        cache_layer = cache.layers[module.layer_idx]
+        if isinstance(cache, QuantizedCache):
+            cache_layer._quantized_keys = cache_layer._quantize(new_keys, axis=cache_layer.axis_key)
+            cache_layer._quantized_values = cache_layer._quantize(new_values, axis=cache_layer.axis_value)
+            cache_layer.keys = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.values = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.cumulative_length = new_keys.shape[2]
+        else:
+            cache_layer.keys = new_keys
+            cache_layer.values = new_values
+
+        return output
 
 
 @dataclass

@@ -126,9 +126,8 @@ PRESS_REGISTRY = {
     # MergingPress: merge-on-evict during prefill (values-only merge preserves RoPE keys)
     "merging_knorm": MergingPress(KnormPress()),
     "merging_snapkv": MergingPress(SnapKVPress()),
-    "merging_expected_attention": MergingPress(ExpectedAttentionPress(epsilon=1e-2)),
+    "merging_adakv_snapkv": MergingPress(AdaKVPress(SnapKVPress())),
+    "merging_dms_kvzap_mlp": MergingPress(DMSPress(press=KVzapPress(model_type="mlp"))),
     # MergingDecodingPress: merge-on-evict during decoding (position-agnostic alternative to CAMPress)
     "merging_decoding_knorm": MergingDecodingPress(base_press=KnormPress()),
-    "merging_decoding_adakv_snapkv": MergingDecodingPress(base_press=AdaKVPress(SnapKVPress())),
-    "expected_attention_bare": ExpectedAttentionPress(epsilon=1e-2),
 }

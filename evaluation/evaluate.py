@@ -26,6 +26,7 @@ from kvpress import (
     DMSPress,
     DuoAttentionPress,
     FinchPress,
+    MergingPress,
     ObservedAttentionPress,
     ScorerPress,
     ThinKPress,
@@ -256,6 +257,10 @@ class EvaluationRunner:
         if isinstance(press, DuoAttentionPress):
             press.head_compression_ratio = compression_ratio
             logger.info(f"Set DuoAttentionPress head_compression_ratio to {compression_ratio}")
+        elif isinstance(press, MergingPress) and isinstance(press.press, DMSPress):
+            assert self.config.threshold is not None, "threshold must be set for MergingPress(DMSPress)"
+            press.threshold = self.config.threshold
+            logger.info(f"Set MergingPress(DMSPress) threshold to {press.threshold}")
         elif isinstance(press, DMSPress):
             assert self.config.threshold is not None, "threshold must be set for DMSPress"
             press.threshold = self.config.threshold

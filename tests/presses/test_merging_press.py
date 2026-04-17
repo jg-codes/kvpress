@@ -12,8 +12,8 @@ from tests.fixtures import unit_test_model  # noqa: F401
 
 
 class TestMergingPress:
-    def test_requires_scorer_press(self):
-        with pytest.raises(AssertionError, match="requires a ScorerPress"):
+    def test_requires_base_press(self):
+        with pytest.raises(AssertionError, match="requires a BasePress"):
             MergingPress(press="not_a_press")
 
     def test_threshold_bounds(self):

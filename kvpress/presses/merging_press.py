@@ -190,21 +190,27 @@ def _merge_on_evict(
 @dataclass
 class MergingPress(BasePress):
     """
-    Scorer-agnostic merge-on-evict wrapper for KV cache compression during prefill.
+    Press-agnostic merge-on-evict wrapper for KV cache compression during prefill.
 
-    Wraps any :class:`ScorerPress` and replaces its hard eviction with merge-on-evict:
+    Wraps any :class:`BasePress` and replaces hard eviction with merge-on-evict:
     each evicted token is folded into its most similar surviving neighbor rather than
     being discarded.  Values are blended via a similarity-weighted average; keys can
     optionally be merged or left unchanged depending on the ``merge_keys`` flag.
 
-    The scoring is delegated entirely to the wrapped press; only the eviction step
-    changes.  This makes the wrapper composable with all existing scorers.
+    **Composition modes:**
 
+    * ``MergingPress(ScorerPress)``: calls ``.score()``, applies uniform per-head
+      budget, returns truncated tensors with merged survivors.
+    * ``MergingPress(AdaKVPress(ScorerPress))``: delegates to AdaKV's adaptive
+      per-head budget allocation, then merges evicted tokens into survivors in-place.
+    * ``MergingPress(DMSPress(ScorerPress))``: delegates to DMSPress's threshold-based
+      eviction via its ``forward_hook``, then merges evicted tokens into survivors.
 
     Parameters
     ----------
-    press : ScorerPress
-        The underlying scoring method whose scores determine which tokens survive.
+    press : BasePress
+        The underlying press.  Can be a :class:`ScorerPress` for uniform merge,
+        or a mask-based / hook-based press for adaptive per-head merge.
     similarity_threshold : float, default=0.0
         Minimum cosine similarity between an evicted key and its nearest survivor
         for the merge to proceed.  Evicted tokens below this threshold are dropped
@@ -227,14 +233,14 @@ class MergingPress(BasePress):
         scaled down proportionally, preventing dilution of high-importance tokens.
     """
 
-    press: ScorerPress
+    press: BasePress
     similarity_threshold: float = 0.0
     merge_keys: bool = False
     value_norm_weighting: bool = True
     max_merge_per_token: int = 0
 
     def __post_init__(self):
-        assert isinstance(self.press, ScorerPress), f"MergingPress requires a ScorerPress, got {type(self.press)}"
+        assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
 
@@ -261,6 +267,16 @@ class MergingPress(BasePress):
         if self.press.compression_ratio == 0:
             return keys, values
 
+        bsz, num_key_value_heads, k_len, head_dim = keys.shape
+
+        # --- ScorerPress path: uniform per-head merge, returns truncated tensors ---
+        if isinstance(self.press, ScorerPress):
+            return self._compress_scorer(module, hidden_states, keys, values, attentions, kwargs)
+
+        # Other press types (AdaKV, etc.) handled in follow-up commits
+        return keys, values
+
+    def _compress_scorer(self, module, hidden_states, keys, values, attentions, kwargs):
         bsz, num_key_value_heads, k_len, head_dim = keys.shape
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
 

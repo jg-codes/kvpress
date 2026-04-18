@@ -31,6 +31,8 @@ def _merge_on_evict(
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
     perturbation_gate: float = 0.0,
+    position_sigma: float = 0,
+    key_merge_window: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Core merge-on-evict kernel for :class:`MergingPress`.
@@ -124,7 +126,17 @@ def _merge_on_evict(
     e_norm = evict_keys_f / e_norms
     s_norm = kept_keys_f / s_norms
     sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))  # (B, H, n_evict, n_kept)
-    max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
+
+    # --- Position-weighted routing (PSMR) ---
+    if position_sigma > 0:
+        # Bias target selection toward positionally nearby survivors
+        pos_dist = (evict_idx.float().unsqueeze(-1) - keep_idx.float().unsqueeze(-2)).abs()
+        routing_score = sim * torch.exp(-pos_dist.pow(2) / (2 * position_sigma**2))
+        _, target_idx = routing_score.max(dim=-1)
+        # Use actual cosine similarity (not position-weighted) for merge weight
+        max_sim = sim.gather(-1, target_idx.unsqueeze(-1)).squeeze(-1)
+    else:
+        max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
     # --- Threshold gate ---
     merge_mask = max_sim >= similarity_threshold
@@ -198,9 +210,26 @@ def _merge_on_evict(
 
     if merge_keys:
         key_accum = torch.zeros(bsz, num_key_value_heads, n_kept, head_dim, device=keys.device, dtype=torch.float32)
-        key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
-        new_keys = (kept_keys.float() + key_accum) / total_w
-        merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+        if key_merge_window > 0:
+            # Tiered: only merge keys for nearby targets (RoPE-safe zone)
+            target_positions = keep_idx.gather(2, target_idx)
+            gap = (evict_idx - target_positions).abs()
+            key_ok = merge_mask & (gap <= key_merge_window)
+            key_w = max_sim.clamp(min=0) * key_ok
+            if value_norm_weighting:
+                key_w = key_w * rel_norm
+            kw = key_w.unsqueeze(-1)
+            key_accum.scatter_add_(2, tgt, kw * evict_keys.float())
+            key_w_accum = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
+            key_w_accum.scatter_add_(2, target_idx, key_w)
+            key_total_w = (1.0 + key_w_accum).unsqueeze(-1)
+            key_active_mask = (key_w_accum > 0).unsqueeze(-1)
+            new_keys = (kept_keys.float() + key_accum) / key_total_w
+            merged_keys = torch.where(key_active_mask, new_keys.to(kept_keys.dtype), kept_keys)
+        else:
+            key_accum.scatter_add_(2, tgt, ew * evict_keys.float())
+            new_keys = (kept_keys.float() + key_accum) / total_w
+            merged_keys = torch.where(active_mask, new_keys.to(kept_keys.dtype), kept_keys)
     else:
         merged_keys = kept_keys
 
@@ -218,6 +247,8 @@ def _merge_on_evict_adaptive(
     merge_fraction: float = 1.0,
     perturbation_gate: float = 0.0,
     diagnostics_out: list | None = None,
+    position_sigma: float = 0,
+    key_merge_window: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Merge-on-evict with variable per-head eviction counts.
@@ -268,7 +299,15 @@ def _merge_on_evict_adaptive(
             e_norms = evict_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
             k_norms = kept_k.norm(dim=-1, keepdim=True).clamp(min=_EPS)
             sim = (evict_k / e_norms) @ (kept_k / k_norms).T
-            max_sim, target = sim.max(dim=-1)
+
+            # --- Position-weighted routing (PSMR) ---
+            if position_sigma > 0:
+                pos_dist = (evict_idx.float().unsqueeze(-1) - keep_idx.float().unsqueeze(0)).abs()
+                routing_score = sim * torch.exp(-pos_dist.pow(2) / (2 * position_sigma**2))
+                _, target = routing_score.max(dim=-1)
+                max_sim = sim.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            else:
+                max_sim, target = sim.max(dim=-1)
 
             merge_ok = max_sim >= similarity_threshold
 
@@ -338,10 +377,29 @@ def _merge_on_evict_adaptive(
             if merge_keys and merged_keys is not None:
                 evict_k_orig = keys[b, h, evict_idx].float()
                 key_accum = torch.zeros(n_kept, head_dim, device=device, dtype=torch.float32)
-                key_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_k_orig), w_exp * evict_k_orig)
-                orig_k = merged_keys[b, h, keep_idx]
-                new_k = (orig_k + key_accum) / total_w
-                merged_keys[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_k, orig_k)
+                if key_merge_window > 0:
+                    # Tiered: only merge keys for nearby targets (RoPE-safe zone)
+                    gap = (evict_idx - keep_idx[target]).abs()
+                    key_ok = merge_ok & (gap <= key_merge_window)
+                    key_w = max_sim.clamp(min=0) * key_ok.float()
+                    if value_norm_weighting:
+                        ev_vnorm = values[b, h, evict_idx].float().norm(dim=-1)
+                        tv_vnorm = values[b, h, keep_idx[target]].float().norm(dim=-1)
+                        key_w = key_w * ev_vnorm / (ev_vnorm + tv_vnorm + _EPS)
+                    kw_exp = key_w.unsqueeze(-1)
+                    key_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_k_orig), kw_exp * evict_k_orig)
+                    key_w_accum = torch.zeros(n_kept, device=device, dtype=torch.float32)
+                    key_w_accum.scatter_add_(0, target, key_w)
+                    key_total_w = (1.0 + key_w_accum).unsqueeze(-1)
+                    key_active = key_w_accum > 0
+                    orig_k = merged_keys[b, h, keep_idx]
+                    new_k = (orig_k + key_accum) / key_total_w
+                    merged_keys[b, h, keep_idx] = torch.where(key_active.unsqueeze(-1), new_k, orig_k)
+                else:
+                    key_accum.scatter_add_(0, target.unsqueeze(-1).expand_as(evict_k_orig), w_exp * evict_k_orig)
+                    orig_k = merged_keys[b, h, keep_idx]
+                    new_k = (orig_k + key_accum) / total_w
+                    merged_keys[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_k, orig_k)
 
     result_values = merged_values.to(values.dtype)
     result_keys = merged_keys.to(keys.dtype) if merge_keys else keys
@@ -400,6 +458,16 @@ class MergingPress(BasePress):
         Maximum per-token perturbation bound for a merge to proceed.  The bound
         is ``‖v_i‖ * (1 - w) / (1 + w)`` where ``w`` is cosine similarity.
         Merges exceeding this bound are skipped (hard-evicted).  ``0.0`` disables.
+    position_sigma : float, default=0
+        Gaussian decay width for position-aware merge routing (PSMR).  When > 0,
+        target selection is biased toward positionally nearby survivors via
+        ``routing_score = cos_sim * exp(-Δpos² / (2σ²))``.  The actual merge weight
+        still uses unweighted cosine similarity.  ``0`` disables (default).
+    key_merge_window : int, default=0
+        Maximum position gap for tiered key merging.  When ``merge_keys=True`` and
+        ``key_merge_window > 0``, keys are only merged for targets within this
+        position window (RoPE-safe zone); values are always merged regardless of
+        distance.  ``0`` disables (uses ``merge_keys`` uniformly).
 
     See also
     --------
@@ -417,6 +485,8 @@ class MergingPress(BasePress):
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
     perturbation_gate: float = 0.0
+    position_sigma: float = 0
+    key_merge_window: int = 0
     diagnostics: bool = False
 
     def __post_init__(self):
@@ -426,6 +496,8 @@ class MergingPress(BasePress):
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
         assert self.perturbation_gate >= 0.0, "perturbation_gate must be non-negative"
+        assert self.position_sigma >= 0, "position_sigma must be non-negative"
+        assert self.key_merge_window >= 0, "key_merge_window must be non-negative"
 
     def get_diagnostics(self) -> list[dict]:
         """Return accumulated per-layer diagnostics (only populated when diagnostics=True)."""
@@ -502,6 +574,8 @@ class MergingPress(BasePress):
             self.value_norm_weighting, self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
             diagnostics_out=diag_out,
+            position_sigma=self.position_sigma,
+            key_merge_window=self.key_merge_window,
         )
         if diag_out:
             self._diagnostics_log.append({
@@ -532,6 +606,8 @@ class MergingPress(BasePress):
             self.value_norm_weighting,
             self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
+            position_sigma=self.position_sigma,
+            key_merge_window=self.key_merge_window,
         )
 
     def _is_hook_based_press(self) -> bool:
@@ -569,6 +645,8 @@ class MergingPress(BasePress):
             self.value_norm_weighting, self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
             diagnostics_out=diag_out,
+            position_sigma=self.position_sigma,
+            key_merge_window=self.key_merge_window,
         )
 
         if diag_out:
@@ -648,6 +726,8 @@ class MergingDecodingPress(DecodingPress):
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
     perturbation_gate: float = 0.0
+    position_sigma: float = 0
+    key_merge_window: int = 0
 
     def compress(
         self,
@@ -682,4 +762,6 @@ class MergingDecodingPress(DecodingPress):
             self.value_norm_weighting,
             self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
+            position_sigma=self.position_sigma,
+            key_merge_window=self.key_merge_window,
         )

@@ -525,3 +525,108 @@ class TestPerturbationGate:
         k2, v2 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True,
                                   perturbation_gate=0.0)
         assert torch.equal(v1, v2), "perturbation_gate=0.0 should produce identical output to default"
+
+
+class TestPSMR:
+    """Tests for Position-Similarity Merge Routing (PSMR)."""
+
+    def test_position_sigma_zero_is_identity(self):
+        """position_sigma=0 should produce identical output to default."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 2, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        k1, v1 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True)
+        k2, v2 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True,
+                                  position_sigma=0)
+        assert torch.equal(k1, k2), "position_sigma=0 should not change keys"
+        assert torch.equal(v1, v2), "position_sigma=0 should not change values"
+
+    def test_position_sigma_changes_targets(self):
+        """position_sigma > 0 should route evicted tokens to nearer survivors."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 1, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        _, v_global = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True,
+                                       position_sigma=0)
+        _, v_local = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, False, True,
+                                      position_sigma=2.0)
+        assert not torch.equal(v_global, v_local), "position_sigma should change merge routing"
+
+    def test_key_merge_window_zero_is_identity(self):
+        """key_merge_window=0 with merge_keys=True should match default merge_keys=True."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 2, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        k1, v1 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, True, True)
+        k2, v2 = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept, 0.0, True, True,
+                                  key_merge_window=0)
+        assert torch.equal(k1, k2), "key_merge_window=0 should not change key merge"
+        assert torch.equal(v1, v2), "key_merge_window=0 should not change values"
+
+    def test_key_merge_window_limits_key_merges(self):
+        """key_merge_window > 0 should only merge keys for nearby targets."""
+        from kvpress.presses.merging_press import _merge_on_evict
+
+        B, H, S, D = 1, 1, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        scores = torch.arange(S).float().unsqueeze(0).unsqueeze(0).expand(B, H, S)
+        n_kept = S // 2
+
+        # Full key merge (no window constraint)
+        k_full, v_full = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept,
+                                          0.0, True, True, key_merge_window=0)
+        # Tiered key merge (only within window=2)
+        k_tiered, v_tiered = _merge_on_evict(keys.clone(), values.clone(), scores, n_kept,
+                                              0.0, True, True, key_merge_window=2)
+
+        # Values should be identical (not affected by key_merge_window)
+        assert torch.equal(v_full, v_tiered), "key_merge_window should not affect value merge"
+        # Keys should differ (some key merges are blocked by window)
+        assert not torch.equal(k_full, k_tiered), "key_merge_window should restrict key merges"
+
+    def test_psmr_adaptive_backward_compat(self):
+        """PSMR defaults should not change adaptive path output."""
+        from kvpress.presses.merging_press import _merge_on_evict_adaptive
+
+        B, H, S, D = 1, 2, 32, 16
+        torch.manual_seed(42)
+        keys = torch.randn(B, H, S, D)
+        values = torch.randn(B, H, S, D)
+        evict_mask = torch.zeros(B, H, S, dtype=torch.bool)
+        evict_mask[:, :, :S // 2] = True  # evict first half
+
+        k1, v1 = _merge_on_evict_adaptive(keys.clone(), values.clone(), evict_mask, 0.0, False, True)
+        k2, v2 = _merge_on_evict_adaptive(keys.clone(), values.clone(), evict_mask, 0.0, False, True,
+                                           position_sigma=0, key_merge_window=0)
+        assert torch.equal(k1, k2)
+        assert torch.equal(v1, v2)
+
+    def test_psmr_with_model(self, unit_test_model):  # noqa: F811
+        """MergingPress with PSMR params should run end-to-end."""
+        base = KnormPress(compression_ratio=0.5)
+        wrapper = MergingPress(press=base, position_sigma=8.0, merge_keys=True, key_merge_window=4)
+        with wrapper(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 64), device=unit_test_model.device)
+            cache = DynamicCache()
+            unit_test_model(input_ids, past_key_values=cache)
+            assert cache.get_seq_length() == 32

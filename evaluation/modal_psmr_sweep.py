@@ -26,7 +26,7 @@ import modal
 _hf_token = os.environ.get("HF_TOKEN", "")
 _secrets = [modal.Secret.from_dict({"HF_TOKEN": _hf_token})] if _hf_token else []
 
-COMMIT = "5865a4f4a501a6cb2b397e336992a85ec9aa641c"  # dev/psmr: PSMR commit
+COMMIT = "eb45642beed5e69260049d414b75385441c70222"  # dev/psmr: PSMR commit
 
 image = (
     modal.Image.debian_slim(python_version="3.11")

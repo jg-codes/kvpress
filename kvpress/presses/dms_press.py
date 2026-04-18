@@ -48,6 +48,7 @@ class DMSPress(BasePress):
     decoding: bool = False
     scores_buffer: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
     compression_ratios: dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    full_scores: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -77,6 +78,7 @@ class DMSPress(BasePress):
         if prefilling and (layer_idx == 0):
             self.scores_buffer.clear()
             self.compression_ratios.clear()
+            self.full_scores.clear()
 
         # Skip compression during decoding if not enabled
         if not prefilling and not self.decoding:
@@ -89,6 +91,7 @@ class DMSPress(BasePress):
         # Accumulate scores in the buffer: reset during prefill, append during decoding
         if prefilling:
             self.scores_buffer[layer_idx] = scores
+            self.full_scores[layer_idx] = scores.detach().cpu()
         else:
             self.scores_buffer[layer_idx] = torch.cat([self.scores_buffer[layer_idx], scores], dim=-1)
 

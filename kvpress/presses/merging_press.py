@@ -217,6 +217,7 @@ def _merge_on_evict_adaptive(
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
     perturbation_gate: float = 0.0,
+    diagnostics_out: list | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Merge-on-evict with variable per-head eviction counts.
@@ -284,6 +285,21 @@ def _merge_on_evict_adaptive(
                 evict_v_norms = values[b, h, evict_idx].float().norm(dim=-1)
                 error_bound = evict_v_norms * (1 - max_sim) / (1 + max_sim + _EPS)
                 merge_ok = merge_ok & (error_bound <= perturbation_gate)
+
+            if diagnostics_out is not None:
+                diagnostics_out.append({
+                    "batch": b,
+                    "head": h,
+                    "evict_positions": evict_idx.cpu(),
+                    "keep_positions": keep_idx.cpu(),
+                    "n_evicted": n_evict,
+                    "n_merged": int(merge_ok.sum().item()),
+                    "similarities": max_sim.cpu(),
+                    "merge_targets": keep_idx[target].cpu(),  # absolute positions of survivors
+                    "merged_mask": merge_ok.cpu(),
+                    "evict_value_norms": values[b, h, evict_idx].float().norm(dim=-1).cpu(),
+                    "keep_value_norms": values[b, h, keep_idx].float().norm(dim=-1).cpu(),
+                })
 
             if not merge_ok.any():
                 continue
@@ -384,6 +400,14 @@ class MergingPress(BasePress):
         Maximum per-token perturbation bound for a merge to proceed.  The bound
         is ``‖v_i‖ * (1 - w) / (1 + w)`` where ``w`` is cosine similarity.
         Merges exceeding this bound are skipped (hard-evicted).  ``0.0`` disables.
+
+    See also
+    --------
+    Bolya et al., "Token Merging", ICLR 2023 — cosine-similarity routing
+    (ViT ancestry).  Zhang et al., "CaM", ICML 2024 — first KV cache
+    merge-over-evict.  Yuan et al., "WeightedKV", ICASSP 2025 — SVD
+    evidence that values are heterogeneous (supports ``merge_keys=False``).
+    Wan et al., "KeepKV", 2025 — Attention Sag analysis and error bounds.
     """
 
     press: BasePress
@@ -393,13 +417,23 @@ class MergingPress(BasePress):
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
     perturbation_gate: float = 0.0
+    diagnostics: bool = False
 
     def __post_init__(self):
+        self._diagnostics_log: list[dict] = []
         assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
         assert self.perturbation_gate >= 0.0, "perturbation_gate must be non-negative"
+
+    def get_diagnostics(self) -> list[dict]:
+        """Return accumulated per-layer diagnostics (only populated when diagnostics=True)."""
+        return self._diagnostics_log
+
+    def clear_diagnostics(self):
+        """Reset diagnostics log between samples."""
+        self._diagnostics_log = []
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -461,12 +495,21 @@ class MergingPress(BasePress):
         evict_mask = torch.zeros(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
         evict_mask[tuple(mask_indices)] = True
 
+        diag_out = [] if self.diagnostics else None
         new_keys, new_values = _merge_on_evict_adaptive(
             keys, values, evict_mask,
             self.similarity_threshold, self.merge_keys,
             self.value_norm_weighting, self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
+            diagnostics_out=diag_out,
         )
+        if diag_out:
+            self._diagnostics_log.append({
+                "layer_idx": module.layer_idx,
+                "n_evicted_total": sum(d["n_evicted"] for d in diag_out),
+                "n_merged_total": sum(d["n_merged"] for d in diag_out),
+                "per_head": diag_out,
+            })
         return new_keys, new_values
 
     def _compress_scorer(self, module, hidden_states, keys, values, attentions, kwargs):
@@ -519,12 +562,29 @@ class MergingPress(BasePress):
         evict_mask[tuple(mask_indices)] = True
 
         # 5. Merge evicted tokens into survivors
+        diag_out = [] if self.diagnostics else None
         new_keys, new_values = _merge_on_evict_adaptive(
             keys, values, evict_mask,
             self.similarity_threshold, self.merge_keys,
             self.value_norm_weighting, self.max_merge_per_token,
             self.merge_fraction, self.perturbation_gate,
+            diagnostics_out=diag_out,
         )
+
+        if diag_out:
+            # Attach DMS importance scores if available
+            dms_scores = getattr(self.press, "full_scores", {}).get(module.layer_idx)
+            if dms_scores is not None:
+                for hd in diag_out:
+                    hd["dms_scores_evicted"] = dms_scores[hd["batch"], hd["head"], hd["evict_positions"]].clone()
+                    hd["dms_scores_kept"] = dms_scores[hd["batch"], hd["head"], hd["keep_positions"]].clone()
+
+            self._diagnostics_log.append({
+                "layer_idx": module.layer_idx,
+                "n_evicted_total": sum(d["n_evicted"] for d in diag_out),
+                "n_merged_total": sum(d["n_merged"] for d in diag_out),
+                "per_head": diag_out,
+            })
 
         # 6. Write merged values back to cache
         cache_layer = cache.layers[module.layer_idx]

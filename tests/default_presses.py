@@ -4,6 +4,7 @@
 import numpy as np
 
 from kvpress import (
+    BoltzmannPress,
     CompactorPress,
     CURPress,
     DuoAttentionPress,
@@ -80,6 +81,10 @@ default_presses = [
     {"cls": QFilterPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {
         "cls": SnapKVPress,
+        "kwargs": [{"compression_ratio": 0.2, "window_size": 2}, {"compression_ratio": 0.8, "window_size": 2}],
+    },
+    {
+        "cls": BoltzmannPress,
         "kwargs": [{"compression_ratio": 0.2, "window_size": 2}, {"compression_ratio": 0.8, "window_size": 2}],
     },
     {"cls": TOVAPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},

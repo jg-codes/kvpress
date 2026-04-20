@@ -7,6 +7,7 @@ from kvpress.pipeline import KVPressTextGenerationPipeline
 from kvpress.presses.adakv_press import AdaKVPress
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
 from kvpress.presses.block_press import BlockPress
+from kvpress.presses.boltzmann_press import BoltzmannPress
 from kvpress.presses.cam_press import CAMPress
 from kvpress.presses.chunk_press import ChunkPress
 from kvpress.presses.chunkkv_press import ChunkKVPress
@@ -75,6 +76,7 @@ __all__ = [
     "FinchPress",
     "LagKVPress",
     "BlockPress",
+    "BoltzmannPress",
     "KeyDiffPress",
     "KVzipPress",
     "ExpectedAttentionStatsPress",

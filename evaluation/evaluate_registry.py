@@ -15,6 +15,7 @@ from benchmarks.zero_scrolls.calculate_metrics import calculate_metrics as zero_
 from kvpress import (
     AdaKVPress,
     BlockPress,
+    BoltzmannPress,
     CAMPress,
     ChunkKVPress,
     CompactorPress,
@@ -99,6 +100,8 @@ PRESS_REGISTRY = {
     "kvzap_mlp_layer": AdaKVPress(KVzapPress(model_type="mlp")),
     "lagkv": LagKVPress(),
     "knorm": KnormPress(),
+    "boltzmann": BoltzmannPress(),
+    "merging_boltzmann": MergingPress(BoltzmannPress()),
     "observed_attention": ObservedAttentionPress(),
     "pyramidkv": PyramidKVPress(),
     "qfilter": QFilterPress(),

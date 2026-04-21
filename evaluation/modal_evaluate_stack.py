@@ -34,8 +34,11 @@ _secrets = [modal.Secret.from_dict({"HF_TOKEN": _hf_token})] if _hf_token else [
 BRANCH = "dev/boltzmann-stack"
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
+    )
     .apt_install("git")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
     .pip_install("packaging", "setuptools", "wheel")
     .run_commands(
         "pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124",
@@ -59,7 +62,7 @@ image = (
 app = modal.App("kvpress-stack-eval", image=image)
 results_vol = modal.Volume.from_name("kvpress-stack-results", create_if_missing=True)
 
-MODEL = "Qwen/Qwen2.5-7B-Instruct"
+MODEL = "Qwen/Qwen3-8B"
 DATASET = "simonjegou/ruler"
 DATA_DIR = "4096"
 DMS_THRESHOLD = -3.0
@@ -87,9 +90,11 @@ def run_condition(config: dict, fraction: float) -> dict:
     from transformers import pipeline as hf_pipeline
 
     import kvpress  # noqa: F401
-    from kvpress import BoltzmannPress, DMSPress, MergingPress, RandomPress
+    from kvpress import BoltzmannPress, DMSPress, KVzapPress, MergingPress
 
     # ─── build press from config ──────────────────────────────────────
+    # DMS inner scorer is KVzapPress(mlp) — RandomPress would give [0,1] scores
+    # that never cross threshold=-3 (zero eviction bug); matches prior eval scripts.
     def build_press(cfg):
         g, cr = cfg["group"], cfg["cr"]
         if g == "baseline":
@@ -99,10 +104,11 @@ def run_condition(config: dict, fraction: float) -> dict:
         if g == "merge_boltzmann":
             return MergingPress(press=BoltzmannPress(compression_ratio=cr))
         if g == "dms":
-            return DMSPress(press=RandomPress(), threshold=DMS_THRESHOLD, sliding_window_size=0)
+            return DMSPress(press=KVzapPress(model_type="mlp"),
+                            threshold=DMS_THRESHOLD, sliding_window_size=128)
         if g == "merge_dms":
-            return MergingPress(press=DMSPress(press=RandomPress(),
-                                               threshold=DMS_THRESHOLD, sliding_window_size=0))
+            return MergingPress(press=DMSPress(press=KVzapPress(model_type="mlp"),
+                                               threshold=DMS_THRESHOLD, sliding_window_size=128))
         raise ValueError(f"Unknown group: {g}")
 
     # ─── scorer (self-contained RULER) ────────────────────────────────
@@ -342,6 +348,81 @@ def main(
 
     print(f"\nSummary saved: {summary_path}")
     print("Per-condition artifacts: Modal volume 'kvpress-stack-results' (/results/stack/)")
+
+
+@app.local_entrypoint()
+def smoke_probe2(fraction: float = 0.005):
+    """Step-B isolation: compose-failure locator + DMS comparison.
+
+    merge_boltzmann_cr0.875_fp16 → merge+aggressive CR, NO quant (quant the culprit?)
+    merge_boltzmann_cr0.5_q4     → full stack at milder CR (dose test)
+    merge_dms_t-3_fp16           → SOTA reference: MergingPress(DMS) no quant
+    merge_dms_t-3_q4             → SOTA reference: MergingPress(DMS) with quanto-4bit
+    """
+    conds = [
+        {"name": "merge_boltzmann_cr0.875_fp16", "group": "merge_boltzmann",
+         "cache_nbits": None, "cr": 0.875},
+        {"name": "merge_boltzmann_cr0.5_q4", "group": "merge_boltzmann",
+         "cache_nbits": 4, "cr": 0.5},
+        {"name": "merge_dms_t-3_fp16", "group": "merge_dms",
+         "cache_nbits": None, "cr": float("nan")},
+        {"name": "merge_dms_t-3_q4", "group": "merge_dms",
+         "cache_nbits": 4, "cr": float("nan")},
+    ]
+    print(f"Smoke probe2: {len(conds)} conditions × f={fraction} on {MODEL}")
+    raw = list(run_condition.starmap([(c, fraction) for c in conds], return_exceptions=True))
+    for c, r in zip(conds, raw):
+        if isinstance(r, Exception):
+            print(f"  ✗ {c['name']}: {r}")
+        else:
+            print(f"  ✓ {c['name']}: mean={r['mean_score']:.1f}  len={r['avg_compressed_len']:.0f}  "
+                  f"t={r['inference_seconds']:.0f}s  peak_vram={r['peak_vram_gb']:.1f}GB")
+
+
+@app.local_entrypoint()
+def smoke_ablate(fraction: float = 0.005):
+    """Step-A isolation: localize which pillar broke the q4 stack.
+
+    no_press_q4         → does optimum-quanto 4-bit alone work on RULER?
+    boltzmann_cr0.875_fp16 → does Boltzmann survive 8x pruning without quant/merge?
+    """
+    conds = [
+        # Re-baseline on Qwen3-8B (prior smokes were Qwen2.5-7B)
+        {"name": "no_press_fp16", "group": "baseline",
+         "cache_nbits": None, "cr": 0.0},
+        {"name": "boltzmann_cr0.5_fp16", "group": "boltzmann",
+         "cache_nbits": None, "cr": 0.5},
+        # Isolation probes
+        {"name": "no_press_q4", "group": "baseline",
+         "cache_nbits": 4, "cr": 0.0},
+        {"name": "boltzmann_cr0.875_fp16", "group": "boltzmann",
+         "cache_nbits": None, "cr": 0.875},
+    ]
+    print(f"Smoke ablate: {len(conds)} conditions × f={fraction} on {MODEL}")
+    raw = list(run_condition.starmap([(c, fraction) for c in conds], return_exceptions=True))
+    for c, r in zip(conds, raw):
+        if isinstance(r, Exception):
+            print(f"  ✗ {c['name']}: {r}")
+        else:
+            print(f"  ✓ {c['name']}: mean={r['mean_score']:.1f}  len={r['avg_compressed_len']:.0f}  "
+                  f"t={r['inference_seconds']:.0f}s  peak_vram={r['peak_vram_gb']:.1f}GB")
+
+
+@app.local_entrypoint()
+def smoke_q4(fraction: float = 0.005):
+    """Run ONLY the merge_boltzmann_cr0.875_q4 condition (stack composition check)."""
+    conds = [
+        {"name": "merge_boltzmann_cr0.875_q4", "group": "merge_boltzmann",
+         "cache_nbits": 4, "cr": 0.875},
+    ]
+    print(f"Smoke q4-only: {len(conds)} condition × f={fraction} on {MODEL}")
+    raw = list(run_condition.starmap([(c, fraction) for c in conds], return_exceptions=True))
+    for c, r in zip(conds, raw):
+        if isinstance(r, Exception):
+            print(f"  ✗ {c['name']}: {r}")
+        else:
+            print(f"  ✓ {c['name']}: mean={r['mean_score']:.1f}  len={r['avg_compressed_len']:.0f}  "
+                  f"t={r['inference_seconds']:.0f}s  peak_vram={r['peak_vram_gb']:.1f}GB")
 
 
 @app.local_entrypoint()

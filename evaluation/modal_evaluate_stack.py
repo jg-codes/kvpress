@@ -351,6 +351,29 @@ def main(
 
 
 @app.local_entrypoint()
+def smoke_dms(fraction: float = 0.005):
+    """Step-C: DMS with proper KVzapPress(mlp) scorer — verifies DMS actually evicts.
+
+    Matches the working eval recipe used in modal_dms_merging_v2.py.
+    Expect: dms_t-3 now < 3608 len (i.e., actually compressing).
+    """
+    conds = [
+        {"name": "dms_t-3_fp16",       "group": "dms",       "cache_nbits": None, "cr": float("nan")},
+        {"name": "merge_dms_t-3_fp16", "group": "merge_dms", "cache_nbits": None, "cr": float("nan")},
+        {"name": "dms_t-3_q4",         "group": "dms",       "cache_nbits": 4,    "cr": float("nan")},
+        {"name": "merge_dms_t-3_q4",   "group": "merge_dms", "cache_nbits": 4,    "cr": float("nan")},
+    ]
+    print(f"Smoke DMS: {len(conds)} conditions × f={fraction} on {MODEL}")
+    raw = list(run_condition.starmap([(c, fraction) for c in conds], return_exceptions=True))
+    for c, r in zip(conds, raw):
+        if isinstance(r, Exception):
+            print(f"  ✗ {c['name']}: {r}")
+        else:
+            print(f"  ✓ {c['name']}: mean={r['mean_score']:.1f}  len={r['avg_compressed_len']:.0f}  "
+                  f"t={r['inference_seconds']:.0f}s  peak_vram={r['peak_vram_gb']:.1f}GB")
+
+
+@app.local_entrypoint()
 def smoke_probe2(fraction: float = 0.005):
     """Step-B isolation: compose-failure locator + DMS comparison.
 

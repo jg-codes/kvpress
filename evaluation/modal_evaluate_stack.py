@@ -44,7 +44,7 @@ image = (
         "pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
-        "transformers>=4.56",
+        "transformers>=4.48,<5.0",
         "datasets",
         "pandas",
         "numpy",

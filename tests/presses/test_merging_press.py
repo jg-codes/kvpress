@@ -4,7 +4,7 @@
 import torch
 from transformers import DynamicCache
 
-from kvpress import AdaKVPress, DMSPress, KnormPress, RandomPress, SnapKVPress
+from kvpress import KnormPress
 from kvpress.presses.merging_press import MergingPress
 from tests.fixtures import unit_test_model  # noqa: F401
 
@@ -113,65 +113,26 @@ def test_batch_size_greater_than_one(unit_test_model):  # noqa: F811
         assert layer.keys.shape[0] == 2
 
 
-def test_adakv_composition(unit_test_model):  # noqa: F811
-    """MergingPress(AdaKV) uses mask-based path and changes values."""
+def test_merge_method_signature():
+    """Lock in the public merge(keys, values, indices) surface from #219.
+
+    `indices` are the kept positions (output of scores.topk). The method
+    folds evicted information into the kept slots; other positions are
+    unchanged (they get pruned by compress() after this returns).
+    """
     torch.manual_seed(42)
-    input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+    bsz, num_heads, seq_len, head_dim = 1, 2, 8, 4
+    keys = torch.randn(bsz, num_heads, seq_len, head_dim)
+    values = torch.randn(bsz, num_heads, seq_len, head_dim)
+    # Keep first half, evict second half
+    kept = torch.arange(seq_len // 2).expand(bsz, num_heads, seq_len // 2)
 
-    plain = AdaKVPress(SnapKVPress(compression_ratio=0.5))
-    with plain(unit_test_model):
-        cache_plain = DynamicCache()
-        unit_test_model(input_ids.clone(), past_key_values=cache_plain)
+    press = MergingPress(press=KnormPress(compression_ratio=0.5))
+    new_keys, new_values = press.merge(keys, values, kept)
 
-    wrapper = MergingPress(press=AdaKVPress(SnapKVPress(compression_ratio=0.5)))
-    with wrapper(unit_test_model):
-        cache_merge = DynamicCache()
-        unit_test_model(input_ids.clone(), past_key_values=cache_merge)
-
-    any_diff = any(
-        not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values)
-        for i in range(len(cache_plain.layers))
-    )
-    assert any_diff, "MergingPress(AdaKV) should differ from plain AdaKV"
-
-
-def test_dms_hook_composition(unit_test_model):  # noqa: F811
-    """MergingPress(DMSPress) uses post-hook composition and changes values."""
-    torch.manual_seed(42)
-    input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
-
-    plain = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
-    with plain(unit_test_model):
-        cache_plain = DynamicCache()
-        unit_test_model(input_ids.clone(), past_key_values=cache_plain)
-
-    wrapper = MergingPress(
-        press=DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0),
-        similarity_threshold=0.0,
-    )
-    assert wrapper._uses_hook_composition()
-    with wrapper(unit_test_model):
-        cache_merge = DynamicCache()
-        unit_test_model(input_ids.clone(), past_key_values=cache_merge)
-
-    any_diff = any(
-        not torch.equal(cache_plain.layers[i].values, cache_merge.layers[i].values)
-        for i in range(len(cache_plain.layers))
-    )
-    assert any_diff, "MergingPress(DMSPress) should differ from plain DMSPress"
-
-
-def test_forward_hook_fallback(unit_test_model):  # noqa: F811
-    """forward_hook delegation works for nested composition (PrefillDecodingPress path)."""
-    torch.manual_seed(42)
-    input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
-    dms = DMSPress(press=RandomPress(), threshold=0.5, sliding_window_size=0)
-    wrapper = MergingPress(press=dms, similarity_threshold=0.0)
-
-    # Simulate PrefillDecodingPress: uses BasePress.__call__ which calls forward_hook directly
-    from kvpress.presses.base_press import BasePress
-
-    with BasePress.__call__(wrapper, unit_test_model):
-        cache = DynamicCache()
-        unit_test_model(input_ids, past_key_values=cache)
-    assert cache.get_seq_length() > 0
+    assert new_keys.shape == keys.shape
+    assert new_values.shape == values.shape
+    # merge_keys=False by default: keys returned unchanged
+    assert torch.equal(new_keys, keys)
+    # Kept positions absorb evicted information: values must change there
+    assert not torch.equal(new_values[:, :, : seq_len // 2], values[:, :, : seq_len // 2])

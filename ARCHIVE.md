@@ -34,19 +34,34 @@ A prefill-time wrapper that replaces hard eviction with merge-on-evict: each evi
 | 2026-05-28 | SimJeg's review: simplify to ScorerPress-only, 2-method API, mark README + docstring 🤖🤖🤖 |
 | 2026-05-30 | Rebased onto current `upstream/main` (`243f71b`); old branch had silently reverted parts of #221, #224, #227, #229. Force-pushed clean 3-commit history. PR body + issue body + title all rewritten in human voice |
 
-## Branch map
+## Branch + tag map
 
-| Branch | Purpose | Status |
+**Active branches:**
+
+| Branch | Purpose |
+|---|---|
+| `pr/merging-press` | **Canonical PR head** — tracks `origin/pr/merging-press` and drives PR #219 |
+| `dev/boltzmann-stack` | Research home — BoltzmannPress + Modal/Kaggle evaluators + analysis scripts |
+| `main` (local, 3 ahead of `origin/main`) | Stale local main; can be reset to `origin/main` whenever |
+
+**Archived branches** (deleted locally; commits preserved as tags on `origin`):
+
+| Tag | Former branch | Notes |
 |---|---|---|
-| `pr/merging-press-v2` | **Canonical PR head** — mirrors `origin/pr/merging-press` and drives PR #219 | active |
-| `pr/merging-press` (local only) | Old pre-rewrite PR branch (8 commits, scope-creep) | obsolete — safe to delete |
-| `dev/boltzmann-stack` | Research home — BoltzmannPress + Modal/Kaggle evaluators + analysis scripts | active |
-| `dev/psmr` | Older tiered key-merging experiment (RoPE-safe positions) | archived |
-| `dev/merging-base-press`, `dev/merging-hook-composition` | Earlier exploratory branches | superseded |
-| `feature/merging-press`, `merging-press` | Earlier naming attempts | superseded |
-| `experimental/archive` | Catch-all archive | superseded |
-| `fix/criticalkv-head-dim` | Unrelated fix experiment | parked |
-| `main` (local) | 3 commits ahead of `origin/main`; predates upstream rebases | stale — discard or rebase |
+| `archive/pr-merging-press` | `pr/merging-press` (pre-rewrite) | 4 unique commits — first simplification attempt, before the rebase onto current main |
+| `archive/dev-psmr` | `dev/psmr` | Tiered key-merging experiment (RoPE-safe positions) |
+| `archive/dev-merging-base-press` | `dev/merging-base-press` | Earlier exploratory branch |
+| `archive/dev-merging-hook-composition` | `dev/merging-hook-composition` | Hook-based composition exploration |
+| `archive/feature-merging-press` | `feature/merging-press` | Early PR naming |
+| `archive/merging-press` | `merging-press` | Older PR naming |
+| `archive/experimental-archive` | `experimental/archive` | Catch-all archive |
+| `archive/fix-criticalkv-head-dim` | `fix/criticalkv-head-dim` | Unrelated fix experiment |
+
+To recover any archived branch:
+
+```bash
+git checkout -b dev/psmr archive/dev-psmr  # example
+```
 
 ## Repo conventions followed
 

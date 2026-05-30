@@ -125,6 +125,6 @@ PRESS_REGISTRY = {
     # MergingPress: merge-on-evict during prefill (values-only merge preserves RoPE keys)
     "merging_knorm": MergingPress(KnormPress()),
     "merging_snapkv": MergingPress(SnapKVPress()),
-    "merging_adakv_snapkv": MergingPress(AdaKVPress(SnapKVPress())),
-    "merging_dms_kvzap_mlp": MergingPress(DMSPress(press=KVzapPress(model_type="mlp"))),
+    "merging_expected_attention": MergingPress(ExpectedAttentionPress(epsilon=1e-2)),
+    "merging_kvzap_mlp": MergingPress(KVzapPress(model_type="mlp")),
 }

@@ -1,0 +1,14 @@
+{
+  "id": "testloc/kvpress-quant-merging-v4",
+  "title": "KVPress Quant Merging v4",
+  "code_file": "kaggle_quant_merging.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "accelerator": "NvidiaTeslaT4",
+  "enable_internet": true,
+  "competition_sources": [],
+  "dataset_sources": [],
+  "kernel_sources": []
+}

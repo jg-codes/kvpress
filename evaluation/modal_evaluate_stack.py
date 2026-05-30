@@ -31,7 +31,7 @@ import modal
 _hf_token = os.environ.get("HF_TOKEN", "")
 _secrets = [modal.Secret.from_dict({"HF_TOKEN": _hf_token})] if _hf_token else []
 
-BRANCH = "dev/boltzmann-stack"
+BRANCH = "7df9779a99b5631ac35185bdb29ea77b64764975"  # dev/boltzmann-stack + KVzap fix
 
 image = (
     modal.Image.from_registry(

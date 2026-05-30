@@ -22,25 +22,9 @@ class MergingPress(BasePress):
     """
     Merge-on-evict wrapper for any :class:`ScorerPress`.
 
-    Replaces hard eviction with merge-on-evict: instead of being discarded, each
-    evicted token's value is folded into its most cosine-similar surviving
-    neighbor via similarity-weighted blending.  Keys are preserved by default,
-    which keeps RoPE positional encoding intact.
-
-    The wrapped press is responsible for scoring; ``MergingPress`` only changes
-    what happens at the eviction step.  ``compress`` mirrors
-    :meth:`ScorerPress.compress` with one extra call to :meth:`merge` inserted
-    between the top-k selection and the gather.
-
-    **Per-token value-reconstruction bound.**  For an evicted token *i* routed
-    to survivor *j* with cosine similarity :math:`w = \\cos(k_i, k_j)`:
-
-    .. math::
-
-        \\|\\Delta v_{\\text{merge}}\\| \\leq \\frac{1}{1 + w} \\;\\|v_i\\|
-
-    This bounds per-token reconstruction error in value space only, not the
-    end-to-end output after softmax re-normalization.
+    Replaces hard eviction with weighted value blending: each evicted token's
+    value is folded into its most cosine-similar surviving neighbor. Keys are
+    preserved by default (RoPE-safe).
 
     Parameters
     ----------
@@ -56,12 +40,6 @@ class MergingPress(BasePress):
         Cap on merges per survivor.  ``0`` disables.
     merge_fraction : float, default=1.0
         Fraction of evicted tokens (ranked by similarity) that are merged.
-
-    References
-    ----------
-    Bolya et al., "Token Merging: Your ViT But Faster", ICLR 2023.
-    Wan et al., "D2O: Dynamic Discriminative Operations", 2024.
-    Huang et al., "KeepKV: Lossless KV Cache Compression", 2025.
     """
 
     press: ScorerPress = None  # type: ignore[assignment]
@@ -127,20 +105,17 @@ class MergingPress(BasePress):
         indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Merge evicted tokens into their most cosine-similar survivors.
+        Fold each evicted token's value into its most cosine-similar survivor.
+
+        Operates on the full tensors; only positions in ``indices`` are updated.
+        Other positions are unchanged — they get pruned by :meth:`compress`
+        after this returns.
 
         Parameters
         ----------
-        keys : Tensor, shape ``(B, H, L, D)``
-        values : Tensor, shape ``(B, H, L, D)``
+        keys, values : Tensor, shape ``(B, H, L, D)``
         indices : Tensor, shape ``(B, H, n_kept)``
-            Indices of surviving tokens (output of ``scores.topk``).
-
-        Returns
-        -------
-        tuple[Tensor, Tensor]
-            ``(keys, values)`` with surviving positions updated to absorb the
-            evicted information.  Other (to-be-pruned) positions are unchanged.
+            Kept-position indices (output of ``scores.topk``).
         """
         bsz, num_kv_heads, k_len, head_dim = keys.shape
         device = keys.device

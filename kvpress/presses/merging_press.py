@@ -12,7 +12,7 @@ from transformers import QuantizedCache
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.scorer_press import ScorerPress
-from kvpress.utils import extract_keys_and_values
+from kvpress.utils import compute_n_kept, extract_keys_and_values
 
 logger = logging.getLogger(__name__)
 
@@ -322,7 +322,7 @@ class MergingPress(BasePress):
         # --- ScorerPress path: uniform per-head merge, returns truncated tensors ---
         if isinstance(self.press, ScorerPress):
             scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
-            n_kept = int(k_len * (1 - self.press.compression_ratio))
+            n_kept = compute_n_kept(k_len, self.press.compression_ratio)
             if n_kept >= k_len:
                 return keys, values
             if n_kept <= 0:

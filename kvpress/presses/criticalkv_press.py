@@ -10,6 +10,7 @@ from transformers.models.llama.modeling_llama import repeat_kv
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.expected_attention_press import ExpectedAttentionPress
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.utils import compute_n_kept
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ class CriticalKVPress(ScorerPress):
         scores = self.press.score(module, hidden_states, keys, values, attentions, kwargs)
         k_len = keys.shape[2]
         selection_budget = int((1 - self.compression_ratio) * k_len * self.first_stage_ratio)
+        if self.first_stage_ratio > 0:
+            # Floor to 1 so short contexts never silently skip stage-1 selection; a zero
+            # budget stays zero when the entire cache is evicted by design (ratio >= 1.0).
+            selection_budget = max(1, selection_budget) if self.compression_ratio < 1.0 else 0
         top_k_index = torch.topk(scores, selection_budget, sorted=True, dim=-1).indices
 
         # Stage 2
@@ -146,8 +151,10 @@ class CriticalAdaKVPress(BasePress):
         bsz, num_key_value_heads, k_len = scores.shape
 
         # Make sure to keep at least alpha * (1 - compression_ratio) KV pairs per head
-        n_kept = int(k_len * (1 - self.compression_ratio))  # ScorerPress definition
+        n_kept = compute_n_kept(k_len, self.compression_ratio)
         n_safe = int(n_kept * self.alpha_safeguard)
+        if self.alpha_safeguard > 0:
+            n_safe = max(1, n_safe) if n_kept > 0 else 0
         top_indices = torch.topk(scores, n_safe, dim=-1).indices
         scores.scatter_(-1, top_indices, torch.finfo(scores.dtype).max)
 

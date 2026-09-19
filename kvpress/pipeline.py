@@ -17,6 +17,7 @@ from kvpress.presses.dms_press import DMSPress
 from kvpress.presses.finch_press import FinchPress
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
 from kvpress.presses.prefill_decoding_press import PrefillDecodingPress
+from kvpress.presses.restorekv_press import RestoreKVPress
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,9 @@ class KVPressTextGenerationPipeline(Pipeline):
             logger.debug(f"Context Length: {context_length}")
             logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
 
+        if isinstance(press, RestoreKVPress):
+            context_length = cache.get_seq_length()
+
         # We only perform decoding compression if the press is a decoding or prefill decoding press
         perform_decoding_compression = press is not None and isinstance(press, (DecodingPress, PrefillDecodingPress))
         if isinstance(press, DMSPress):
@@ -291,7 +295,7 @@ class KVPressTextGenerationPipeline(Pipeline):
             input_ids=question_ids.to(self.model.device),
             past_key_values=cache,
             position_ids=position_ids,
-            num_logits_to_keep=1,
+            logits_to_keep=1,
         )
 
         position_ids = position_ids[:, -1:] + 1

@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from kvpress.presses.base_press import BasePress
+from kvpress.presses.base_press import BasePress, is_prefilling
 from kvpress.presses.scorer_press import ScorerPress
 from kvpress.utils import extract_keys_and_values
 
@@ -17,7 +17,10 @@ class DMSPress(BasePress):
     """
     Based on Dynamic Memory Sparsification (DMS, https://arxiv.org/abs/2506.05345) inference.
     Wraps a ScorerPress and evicts keys/values with scores below a given threshold.
-    This press implements a dense-prefill version of DMS, not the sparse-prefill version.
+    This press implements a dense-prefill version of DMS, not the sparse-prefill version,
+    and does not include the trained evictors from the paper.
+    For a faithful implementation, please refer to https://huggingface.co/nvidia/Qwen3-8B-DMS-8x or
+    https://github.com/NVIDIA/Model-Optimizer/tree/main/experimental/dms
 
     Unlike most presses that use a fixed compression_ratio, DMSPress uses a score threshold
     to determine which KV pairs to evict. This allows for adaptive compression where the actual
@@ -68,7 +71,7 @@ class DMSPress(BasePress):
         cache = kwargs["past_key_values"]
         q_len = hidden_states.shape[1]
         cache_len = kwargs["cache_position"][-1] + 1
-        prefilling = cache_len == q_len
+        prefilling = is_prefilling(kwargs["cache_position"], q_len)
 
         # Extract layer index as int for type safety
         layer_idx: int = module.layer_idx  # type: ignore[assignment]

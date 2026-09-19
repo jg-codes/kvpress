@@ -12,7 +12,7 @@ from transformers import PreTrainedModel
 from transformers.cache_utils import QuantizedCache
 
 from kvpress.presses.adakv_press import AdaKVPress
-from kvpress.presses.base_press import BasePress
+from kvpress.presses.base_press import BasePress, is_prefilling
 from kvpress.presses.scorer_press import ScorerPress
 from kvpress.utils import extract_keys_and_values
 
@@ -100,8 +100,9 @@ class DecodingPress(BasePress):
             storing existing scores in a buffer (e.g. KNormPress) and reusing them in subsequent compressions.
         """
         k_len = keys.shape[2]
-        target_compression_ratio = self._find_target_compression_ratio(k_len, self.target_size)
-        logger.debug(f"Compressing {k_len} to {self.target_size} with ratio {target_compression_ratio}")
+        target_size = self._resolve_target_size(kwargs)
+        target_compression_ratio = self._find_target_compression_ratio(k_len, target_size)
+        logger.debug(f"Compressing {k_len} to {target_size} with ratio {target_compression_ratio}")
 
         original_compression_ratio = self.base_press.compression_ratio
         self.base_press.compression_ratio = target_compression_ratio
@@ -125,7 +126,7 @@ class DecodingPress(BasePress):
         layer_idx = module.layer_idx
 
         # Only operate during decoding phase (after prefilling)
-        if kwargs["cache_position"][-1] <= q_len:
+        if is_prefilling(kwargs["cache_position"], q_len):
             # We're still in prefilling phase, don't do anything
             return output
         # print(f"Adding hidden states to buffer: {hidden_states.shape}")
@@ -136,7 +137,8 @@ class DecodingPress(BasePress):
         self.layer_step_counts[layer_idx] += 1
 
         # Apply compression if we've reached the compression step threshold
-        if (self.layer_step_counts[layer_idx] >= self.compression_interval) or (q_len >= self.target_size):
+        target_size = self._resolve_target_size(kwargs)
+        if (self.layer_step_counts[layer_idx] >= self.compression_interval) or (q_len >= target_size):
             logger.debug(
                 f"Applying decoding compression: layer_step_count ({self.layer_step_counts[layer_idx]}) >= compression_steps ({self.compression_interval})"  # noqa: E501
             )
@@ -232,3 +234,6 @@ class DecodingPress(BasePress):
             )
 
         return ratio
+
+    def _resolve_target_size(self, kwargs: dict) -> int:
+        return self.target_size

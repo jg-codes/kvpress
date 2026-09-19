@@ -60,9 +60,9 @@ Decoding Compression
 By default, KVPress applies compression during the prefilling phase. As a new (experimental) feature, we now support decoding compression via the `DecodingPress` wrapper. `DecodingPress` compresses the KV cache periodically during token generation, optionally maintaining a buffer of recent hidden states. `DecodingPress` supports the following parameters:
 
 - `base_press`: Any ScorerPress (e.g., `KNormPress`, `CriticalKVPress`)
-- `compression_interval`: Steps between compressions (default: 10)
-- `target_size`: Target cache size of the cache after compression (default: 1024)
-- `hidden_states_buffer_size`: Number of hidden states to buffer before compression (default: 128). Some presses don't need buffered hidden states and can set this to 0.
+- `compression_interval`: Steps between compressions (default: 512)
+- `target_size`: Target cache size after compression (default: 2048)
+- `hidden_states_buffer_size`: Number of hidden states to buffer before compression (default: 256). Some presses don't need buffered hidden states and can set this to 0.
 
 Unlike a compression ratio, decoding press uses a `target_size` to compress the cache. This means that the cache is compressed every `compression_interval` steps, and the compression ratio is automatically computed such that the size of the cache after compression equals `target_size`.
 
@@ -79,11 +79,11 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 model_kwargs = {"attn_implementation": "flash_attention_2"}
 pipe = pipeline("kv-press-text-generation", model=model, device=device, model_kwargs=model_kwargs)
 
-# Create a decoding press that compresses every 10 steps to 512 tokens
+# Create a decoding press that compresses every 10 steps to a target cache size of 512 tokens
 decoding_press = DecodingPress(
     base_press=KnormPress(),
-    compression_steps=10,
-    token_buffer_size=512
+    compression_interval=10,
+    target_size=512
 )
 
 # Use with pipeline
@@ -117,8 +117,9 @@ Several presses inherit from `ScorerPress` ([source](kvpress/presses/scorer_pres
 - `LeverageScorePress` ([source](kvpress/presses/leverage_press.py), [paper](https://arxiv.org/abs/2507.08143)): evict tokens based on approximate statistical leverage (i.e we preserve outliers in the key space).
 - `CompactorPress` ([source](kvpress/presses/compactor_press.py), [paper](https://arxiv.org/abs/2507.08143)): blend `NonCausalAttnPress` and `LeverageScorePress` based on the compression_ratio.
 - `CURPress` ([source](kvpress/presses/cur_press.py), [paper](https://arxiv.org/abs/2509.15038)): prune keys and values based on the CUR decomposition using approximate leverage scores.
-- `KVzapPress` ([source](kvpress/presses/kvzap/kvzap_press.py), [paper](https://arxiv.org/abs/2601.07891), [training](kvzap)): approximate KVzip+ using a fast surrogate model. To be used in conjunction with the `DMSPress`.
+- `KVzapPress` ([source](kvpress/presses/kvzap_press.py), [paper](https://arxiv.org/abs/2601.07891), [training](kvzap)): approximate KVzip+ using a fast surrogate model. To be used in conjunction with the `DMSPress`.
 - `FastKVzipPress` ([source](kvpress/presses/fastkvzip_press.py), [paper](https://arxiv.org/abs/2601.17668)): approximate KVzip through a lightweight gating mechanism.
+- `CapPress` ([source](kvpress/presses/cap_press.py), [paper](https://arxiv.org/abs/2604.25975)): evict tokens based on query-aware capacity scores from a log-determinant leverage proxy.
 
 Some presses rely on a different logic:
 - `ThinKPress` ([source](kvpress/presses/think_press.py), [paper](https://arxiv.org/abs/2407.21018)): compress the dimensions of the keys based on the channel attention score on the last queries 
@@ -126,6 +127,8 @@ Some presses rely on a different logic:
 - `DuoAttentionPress` ([source](kvpress/presses/duo_attention_press.py), [paper](https://arxiv.org/abs/2410.10819)): split heads into retrieval heads (no compression) and streaming heads (StreamingLLM approach)
 - `FinchPress` ([source](kvpress/presses/finch_press.py), [paper](https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00716/125280)): similar to SnapKV with a dynamic window size and key value re-rotation
 - `KVzipPress` ([source](kvpress/presses/kvzip_press.py), [paper](https://arxiv.org/abs/2505.23416)): identify redundant KV pairs through context reconstruction. Achieve near-lossless compression at the cost of multiple forward passes.
+- `KVgradPress` ([source](kvpress/presses/kvgrad_press.py), [paper](https://openreview.net/forum?id=cg1wTCJjjk)): similar to `KVzipPress`, but scores KV pairs by an input × gradient attribution of their effect on the last hidden states, at the cost of one backward pass per chunk.
+- `RestoreKVPress` ([source](kvpress/presses/restorekv_press.py), [paper](https://arxiv.org/abs/2608.01247)): extends the KV cache with 8 learned restore tokens encoded by a LoRA module before budget-matched KVzip pruning.
 - `KVComposePress` ([source](kvpress/presses/kvcompose_press.py), [paper](https://arxiv.org/abs/2509.05165)): attention-guided eviction, aligning per-head selections into composite tokens to preserve cache structure.
 
 > [!NOTE]  
@@ -133,16 +136,19 @@ Some presses rely on a different logic:
 
 Finally we provide wrapper presses that can be combined with other presses:
 - `AdaKVPress` ([source](kvpress/presses/adakv_press.py), [paper](https://arxiv.org/abs/2407.11550)): prune bottom scores of any `ScorerPress` but across all heads, achieving head-wise compressions 
+- `LUKVPress` ([source](kvpress/presses/lukv_press.py), [paper](https://arxiv.org/abs/2602.08585)): applies layer/head budget curves to a `ScorerPress`
 - `PerLayerCompressionPress` ([source](kvpress/presses/per_layer_compression_press.py)): compress each layer with a different compression ratio (experimental)
 - `ComposedPress` ([source](kvpress/presses/composed_press.py)): compose multiple presses together by chaining their forward hooks
 - `KeyRerotationPress` ([source](kvpress/presses/key_rerotation_press.py)): rerotate pruned keys to have continuous RoPE embeddings
 - `ChunkKVPress` ([source](kvpress/presses/chunkkv_press.py), [paper](https://arxiv.org/abs/2502.00299)): compress by selecting important chunks, preserving semantic coherence
+- `EntropyGatedChunkKVPress` ([source](kvpress/presses/entropy_gated_chunkkv_press.py)): similar to `ChunkKVPress`, but reduces the length of chunks with high scores but low entropy, freeing budget for more chunks.
 - `ChunkPress` ([source](kvpress/presses/chunk_press.py), [paper](https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00716/125280)): compress the KV cache on each sequence chunk separately. This can yield to more uniform compression across long sequences
 - `CriticalKVPress` and `CriticalAdaKVPress` ([source](kvpress/presses/criticalkv_press.py), [paper](https://arxiv.org/abs/2502.03805)): refine the scores using the L1 norm of Wo @ values, coupled with a two-stage selection.
 - `BlockPress` ([source](kvpress/presses/block_press.py), [paper](https://arxiv.org/abs/2504.15364)): segment input sequence into non-overlapping blocks and compress iteratively (⚠️ not a true chunked-prefill implementation)
 - `DecodingPress` ([source](kvpress/presses/decoding_press.py)): allow for compression during decoding, see decoding section in this README.
+- `CompressionRatioDecodingPress` ([source](kvpress/presses/compression_ratio_decoding_press.py)): compress during decoding to keep a fixed fraction of all tokens seen so far.
 - `PrefillDecodingPress` ([source](kvpress/presses/prefill_decoding_press.py)): allow to compress both during prefilling and during decoding.
-- `DMSPress` ([source](kvpress/presses/dms_press.py), [paper](https://arxiv.org/abs/2506.05345)): evict keys and values with scores below a given threshold of any `ScorerPress` instead of relying on top-k scores. Support both prefilling and decoding (if decoding=True), but only supports dense-prefill and not sparse-prefill.
+- `DMSPress` ([source](kvpress/presses/dms_press.py), [paper](https://arxiv.org/abs/2506.05345)): evict keys and values with scores below a given threshold of any `ScorerPress` instead of relying on top-k scores. Support both prefilling and decoding (if decoding=True), but only supports dense-prefill and not sparse-prefill. ⚠️ Does not include the trained evictors from the DMS paper.
 - `CAMPress` ([source](kvpress/presses/cam_press.py), [paper](https://openreview.net/forum?id=LCTmppB165)): A decoding press that merges the kv cache of evicted tokens into keep tokens to preserve information.
 - `MergingPress` ([source](kvpress/presses/merging_press.py)): scorer-agnostic merge-on-evict wrapper that folds evicted tokens into their most similar survivor instead of discarding them. Works during prefill.
 
@@ -300,11 +306,11 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 model_kwargs = {"attn_implementation": "flash_attention_2"}
 pipe = pipeline("kv-press-text-generation", model=model, device=device, model_kwargs=model_kwargs)
 
-# Create a decoding press that compresses every 10 steps to 512 tokens
+# Create a decoding press that compresses every 10 steps to a target cache size of 512 tokens
 decoding_press = DecodingPress(
     base_press=KnormPress(),
-    compression_steps=10,
-    token_buffer_size=512
+    compression_interval=10,
+    target_size=512
 )
 
 # Use with pipeline
@@ -330,8 +336,8 @@ pipe = pipeline("kv-press-text-generation", model=model, device=device, model_kw
 prefill_press = CriticalKVPress(KnormPress())
 decoding_press = DecodingPress(
     base_press=KnormPress(compression_ratio=0.2),
-    compression_steps=5,
-    token_buffer_size=256
+    compression_interval=5,
+    target_size=256
 )
 
 # Combine them

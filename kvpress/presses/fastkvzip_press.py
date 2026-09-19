@@ -9,13 +9,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Generator
 
+import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from torch import nn
 from transformers import AutoConfig, Gemma3ForConditionalGeneration, PreTrainedModel
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
-from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
+from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress, is_prefilling
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +124,19 @@ def get_gate_weight(model_name: str):
     gate_id = get_gate_id(model_name)
     file_path = hf_hub_download(repo_id="Jang-Hyun/Fast-KVzip", filename=gate_id, repo_type="model")
 
-    # Load the PyTorch tensor/dictionary
-    weights = torch.load(file_path, weights_only=False)["module"]
+    with torch.serialization.safe_globals(
+        [
+            (
+                np._core.multiarray._reconstruct,  # type: ignore[attr-defined]
+                "numpy.core.multiarray._reconstruct",
+            ),
+            np.ndarray,
+            np.dtype,
+            np.dtypes.Float64DType,
+            np.dtypes.Float32DType,
+        ]
+    ):
+        weights = torch.load(file_path, weights_only=True)["module"]
     return weights, gate_id
 
 
@@ -223,7 +235,7 @@ class FastKVzipPress(BasePress):
         q_len = hidden_states.shape[1]
 
         # Don't compress after pre-filling
-        if kwargs["cache_position"][-1] > q_len:
+        if not is_prefilling(kwargs["cache_position"], q_len):
             return output
 
         self._score_fast(module, hidden_states)
@@ -241,7 +253,9 @@ class FastKVzipPress(BasePress):
 
         ctx_len = scores.size(-1)
         if ctx_len < 32000:
-            window_size = int(ctx_len * self.window_ratio)
+            # max(1, ...) so a short context never yields window_size == 0: the slice
+            # [:, :, -0:] would protect the entire context instead of a local window.
+            window_size = max(1, int(ctx_len * self.window_ratio))
         else:
             window_size = self.window_size
         scores[:, :, -window_size:] = 1.0

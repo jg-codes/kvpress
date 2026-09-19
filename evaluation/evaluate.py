@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import json
@@ -47,6 +47,7 @@ class EvaluationConfig:
     press_name: str = "knorm"
     compression_ratio: float = 1.0
     key_channel_compression_ratio: Optional[float] = None
+    head_compression_ratio: Optional[float] = None
     threshold: Optional[float] = None
 
     # Dataset and generation parameters
@@ -67,6 +68,7 @@ class EvaluationConfig:
 
     # Model-specific parameters
     model_kwargs: Optional[Dict[str, Any]] = None
+    trust_remote_code: bool = False
 
     # Press information (will be set after press setup)
     press_init_command: Optional[str] = None
@@ -133,6 +135,8 @@ class EvaluationConfig:
 
         if self.threshold is not None:
             components[-1] = f"{self.threshold:.2f}"
+        elif self.head_compression_ratio is not None:
+            components[-1] = f"{self.head_compression_ratio:.2f}"
         if self.fraction < 1.0:
             components.append(f"fraction{self.fraction:.3f}")
         if self.max_context_length is not None:
@@ -162,8 +166,15 @@ class EvaluationConfig:
         """
         Saves the evaluation configuration to a YAML file.
         """
+        config_dict = asdict(self)
+        if self.threshold is not None or self.head_compression_ratio is not None:
+            config_dict.pop("compression_ratio", None)
+        if self.threshold is None:
+            config_dict.pop("threshold", None)
+        if self.head_compression_ratio is None:
+            config_dict.pop("head_compression_ratio", None)
         with open(str(config_filename), "w") as f:
-            yaml.dump(asdict(self), f, default_flow_style=False, indent=2, sort_keys=False)
+            yaml.dump(config_dict, f, default_flow_style=False, indent=2, sort_keys=False)
 
 
 def _load_yaml_config(path: str | Path) -> dict:
@@ -255,8 +266,11 @@ class EvaluationRunner:
 
         # Apply compression ratios based on press type
         if isinstance(press, DuoAttentionPress):
-            press.head_compression_ratio = compression_ratio
-            logger.info(f"Set DuoAttentionPress head_compression_ratio to {compression_ratio}")
+            assert (
+                self.config.head_compression_ratio is not None
+            ), "head_compression_ratio must be set for DuoAttentionPress"
+            press.head_compression_ratio = self.config.head_compression_ratio
+            logger.info(f"Set DuoAttentionPress head_compression_ratio to {press.head_compression_ratio}")
         elif isinstance(press, MergingPress) and isinstance(press.press, DMSPress):
             assert self.config.threshold is not None, "threshold must be set for MergingPress(DMSPress(...))"
             press.press.threshold = self.config.threshold
@@ -377,11 +391,15 @@ class EvaluationRunner:
                 pass
 
         logger.info(f"Loading model pipeline for: {model_name} on device: {device} with model_kwargs: {model_kwargs}")
-        pipeline_kwargs = {
+        pipeline_kwargs: Dict[str, Any] = {
             "model": model_name,
             "model_kwargs": model_kwargs,
-            "trust_remote_code": True,
         }
+        if self.config.trust_remote_code:
+            logger.warning(
+                "trust_remote_code=True: the model repository can execute arbitrary Python code during loading."
+            )
+            pipeline_kwargs["trust_remote_code"] = True
         if device == "auto":
             pipeline_kwargs["device_map"] = "auto"
         else:

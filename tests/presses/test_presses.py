@@ -15,11 +15,13 @@ from kvpress import (
     CriticalAdaKVPress,
     CriticalKVPress,
     DMSPress,
+    EntropyGatedChunkKVPress,
     FastKVzipPress,
     KeyRerotationPress,
     KnormPress,
     KVComposePress,
     KVzipPress,
+    MergingPress,
     ObservedAttentionPress,
     ScorerPress,
     SnapKVPress,
@@ -72,6 +74,8 @@ def test_chunkkv_press(unit_test_model):  # noqa: F811
         CriticalKVPress,
         CriticalAdaKVPress,
         DMSPress,
+        MergingPress,
+        EntropyGatedChunkKVPress,
     ],
 )
 def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
@@ -88,7 +92,17 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
                 press = ComposedPress(presses=[press])
             elif not isinstance(press, ScorerPress):  # remaining wrapper presses only support ScorerPress
                 return
-            elif issubclass(wrapper_press, (KeyRerotationPress, AdaKVPress, CriticalKVPress, CriticalAdaKVPress)):
+            elif issubclass(
+                wrapper_press,
+                (
+                    KeyRerotationPress,
+                    AdaKVPress,
+                    CriticalKVPress,
+                    CriticalAdaKVPress,
+                    MergingPress,
+                    EntropyGatedChunkKVPress,
+                ),
+            ):
                 press = wrapper_press(press=press)
             elif issubclass(wrapper_press, ChunkPress):
                 press = ChunkPress(press=press, chunk_length=24)

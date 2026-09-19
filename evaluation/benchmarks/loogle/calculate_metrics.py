@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import ast
+
 import nltk
 import pandas as pd
 from bert_score import score
@@ -39,9 +41,9 @@ def get_meteor_score(reference, hypothesis):
 
 def get_exact_match(reference, hypothesis):
     try:
-        reference = eval(reference)
+        reference = ast.literal_eval(reference)
         count = len(reference)
-        hypothesis = eval(hypothesis)
+        hypothesis = ast.literal_eval(hypothesis)
         assert isinstance(hypothesis, dict)
     except Exception:
         return 0, 1
@@ -54,10 +56,10 @@ def get_exact_match(reference, hypothesis):
 
 
 def get_partial_match(reference, hypothesis):
-    reference = eval(reference)
+    reference = ast.literal_eval(reference)
     count = len(reference)
     try:
-        hypothesis = eval(hypothesis)
+        hypothesis = ast.literal_eval(hypothesis)
         assert isinstance(hypothesis, dict)
         partial_score_count = 0
         for key in reference:

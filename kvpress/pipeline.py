@@ -223,7 +223,8 @@ class KVPressTextGenerationPipeline(Pipeline):
             logger.debug(f"Context Length: {context_length}")
             logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
 
-        if isinstance(press, RestoreKVPress):
+        if isinstance(press, RestoreKVPress) or isinstance(getattr(press, "press", None), RestoreKVPress):
+            # RestoreKV appends restore tokens to the cache; questions must continue after them
             context_length = cache.get_seq_length()
 
         # We only perform decoding compression if the press is a decoding or prefill decoding press

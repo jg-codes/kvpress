@@ -3,6 +3,7 @@
 
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -305,6 +306,81 @@ class MergingPress(BasePress):
         """Check if the inner press uses forward_hook instead of compress."""
         return type(self.press).compress is BasePress.compress and type(self.press).forward_hook is not BasePress.forward_hook
 
+    def _is_call_overriding_press(self) -> bool:
+        """Check if the inner press drives compression from its own ``__call__`` (KVzip family).
+
+        Such presses score in forward hooks but evict only in ``compress_post`` (called from
+        their ``__call__`` after prefill), by setting ``module.masked_key_indices``. Registering
+        ``MergingPress.forward_hook`` alone would run neither their scoring passes nor their
+        eviction, so the merge must be attached to ``compress_post`` instead.
+        """
+        return type(self.press).__call__ is not BasePress.__call__ and hasattr(self.press, "compress_post")
+
+    @contextmanager
+    def __call__(self, model):
+        if not self._is_call_overriding_press():
+            with super().__call__(model):
+                yield
+            return
+
+        inner = self.press
+        original_compress_post = inner.compress_post
+
+        def compress_post_then_merge(model_):
+            original_compress_post(model_)
+            self.merge_masked_cache(model_, inner._cache)
+
+        inner.compress_post = compress_post_then_merge  # instance attribute shadows the class method
+        try:
+            with inner(model):
+                yield
+        finally:
+            del inner.compress_post
+
+    def merge_masked_cache(self, model, cache):
+        """Merge evicted tokens into survivors for every layer whose ``masked_key_indices`` is set.
+
+        Used for call-overriding inner presses (KVzip family, incl. RestoreKVPress) right after
+        their ``compress_post`` has decided the eviction. Evicted positions stay in the cache
+        (they are masked at attention time); only survivor values (and keys if ``merge_keys``)
+        are rewritten.
+        """
+        language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+        for layer in language_model.layers:
+            module = layer.self_attn
+            mask_indices = getattr(module, "masked_key_indices", None)
+            if mask_indices is None or len(mask_indices[0]) == 0:
+                continue
+            keys, values = extract_keys_and_values(cache, module.layer_idx)
+            bsz, num_kv_heads, k_len, head_dim = keys.shape
+            evict_mask = torch.zeros(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+            evict_mask[tuple(i.to(keys.device) for i in mask_indices)] = True
+            new_keys, new_values = _merge_on_evict_adaptive(
+                keys,
+                values,
+                evict_mask,
+                self.similarity_threshold,
+                self.merge_keys,
+                self.value_norm_weighting,
+                self.max_merge_per_token,
+                self.merge_fraction,
+                self.perturbation_gate,
+            )
+            self._write_back(cache, module.layer_idx, new_keys, new_values)
+
+    @staticmethod
+    def _write_back(cache, layer_idx, new_keys, new_values):
+        cache_layer = cache.layers[layer_idx]
+        if isinstance(cache, QuantizedCache):
+            cache_layer._quantized_keys = cache_layer._quantize(new_keys, axis=cache_layer.axis_key)
+            cache_layer._quantized_values = cache_layer._quantize(new_values, axis=cache_layer.axis_value)
+            cache_layer.keys = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.values = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
+            cache_layer.cumulative_length = new_keys.shape[2]
+        else:
+            cache_layer.keys = new_keys
+            cache_layer.values = new_values
+
     def compress(
         self,
         module: nn.Module,
@@ -414,16 +490,7 @@ class MergingPress(BasePress):
         )
 
         # 6. Write merged values back to cache (evicted positions stay masked)
-        cache_layer = cache.layers[module.layer_idx]
-        if isinstance(cache, QuantizedCache):
-            cache_layer._quantized_keys = cache_layer._quantize(new_keys, axis=cache_layer.axis_key)
-            cache_layer._quantized_values = cache_layer._quantize(new_values, axis=cache_layer.axis_value)
-            cache_layer.keys = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
-            cache_layer.values = torch.zeros(0, dtype=new_keys.dtype, device=new_keys.device)
-            cache_layer.cumulative_length = new_keys.shape[2]
-        else:
-            cache_layer.keys = new_keys
-            cache_layer.values = new_values
+        self._write_back(cache, module.layer_idx, new_keys, new_values)
 
         return output
 

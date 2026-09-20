@@ -262,6 +262,21 @@ class MergingPress(BasePress):
         this threshold are skipped (hard-evicted instead).  ``0.0`` disables the
         gate.  Useful for preventing regressions on exact-match tasks (e.g. QA)
         where high-norm answer tokens should not be blended into context survivors.
+    exclude_restore_targets : bool, default=False
+        Call-overriding inner presses only (KVzip family).  When ``True``, cache positions
+        ``>= press.context_length`` (e.g. the restore slots appended by
+        :class:`RestoreKVPress`) are never merge *targets*.  They are never evicted by
+        the inner press, so they are never merge sources either.
+    exclude_sink_targets : bool, default=False
+        Call-overriding inner presses only.  When ``True``, the first ``press.n_sink``
+        positions are never merge targets.
+    count_logit_bias : bool, default=False
+        Call-overriding inner presses only.  When ``True``, every survivor that absorbed
+        ``M`` evicted tokens receives an additive attention-logit bias ``log(1 + M)``
+        (KeepKV, arXiv:2504.09936) at attention time, applied through the attention
+        mask by :func:`kvpress.attention_patch.attention_patch`.  Unmerged positions
+        get bias 0.  Requires an attention implementation that accepts an additive
+        float mask (eager, sdpa); not compatible with flash attention.
     """
 
     press: BasePress
@@ -271,6 +286,9 @@ class MergingPress(BasePress):
     max_merge_per_token: int = 0
     merge_fraction: float = 1.0
     perturbation_gate: float = 0.0
+    exclude_restore_targets: bool = False
+    exclude_sink_targets: bool = False
+    count_logit_bias: bool = False
 
     def __post_init__(self):
         assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
@@ -278,6 +296,11 @@ class MergingPress(BasePress):
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
         assert self.perturbation_gate >= 0.0, "perturbation_gate must be non-negative"
+        if self.exclude_restore_targets or self.exclude_sink_targets or self.count_logit_bias:
+            assert self._is_call_overriding_press(), (
+                "exclude_restore_targets / exclude_sink_targets / count_logit_bias are implemented for "
+                "call-overriding inner presses (KVzip family, RestoreKVPress) only"
+            )
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -325,6 +348,10 @@ class MergingPress(BasePress):
 
         inner = self.press
         original_compress_post = inner.compress_post
+        language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+        for layer in language_model.layers:
+            layer.self_attn.merge_logit_bias = None
+            layer.self_attn.merge_counts = None
 
         def compress_post_then_merge(model_):
             original_compress_post(model_)
@@ -346,8 +373,14 @@ class MergingPress(BasePress):
         are rewritten.
         """
         language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+        context_length = getattr(self.press, "context_length", None)
+        n_sink = int(getattr(self.press, "n_sink", 0) or 0)
+        if self.exclude_restore_targets and not context_length:
+            raise ValueError("exclude_restore_targets requires the inner press to expose a positive context_length")
         for layer in language_model.layers:
             module = layer.self_attn
+            module.merge_logit_bias = None
+            module.merge_counts = None
             mask_indices = getattr(module, "masked_key_indices", None)
             if mask_indices is None or len(mask_indices[0]) == 0:
                 continue
@@ -355,7 +388,14 @@ class MergingPress(BasePress):
             bsz, num_kv_heads, k_len, head_dim = keys.shape
             evict_mask = torch.zeros(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
             evict_mask[tuple(i.to(keys.device) for i in mask_indices)] = True
-            new_keys, new_values = _merge_on_evict_adaptive(
+            target_mask = None
+            if self.exclude_restore_targets or self.exclude_sink_targets:
+                target_mask = torch.ones(bsz, num_kv_heads, k_len, device=keys.device, dtype=torch.bool)
+                if self.exclude_restore_targets:
+                    target_mask[:, :, int(context_length):] = False
+                if self.exclude_sink_targets and n_sink > 0:
+                    target_mask[:, :, :n_sink] = False
+            new_keys, new_values, counts = _merge_on_evict_adaptive(
                 keys,
                 values,
                 evict_mask,
@@ -365,8 +405,13 @@ class MergingPress(BasePress):
                 self.max_merge_per_token,
                 self.merge_fraction,
                 self.perturbation_gate,
+                target_mask=target_mask,
+                return_counts=True,
             )
             self._write_back(cache, module.layer_idx, new_keys, new_values)
+            module.merge_counts = counts
+            if self.count_logit_bias:
+                module.merge_logit_bias = torch.log1p(counts)
 
     @staticmethod
     def _write_back(cache, layer_idx, new_keys, new_values):
@@ -588,7 +633,9 @@ def _merge_on_evict_adaptive(
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
     perturbation_gate: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    target_mask: torch.Tensor | None = None,
+    return_counts: bool = False,
+):
     """
     Merge-on-evict with variable per-head eviction counts for :class:`MergingPress`.
 
@@ -615,12 +662,20 @@ def _merge_on_evict_adaptive(
         Scale merge weight by relative value-vector L2 norm.
     max_merge_per_token : int, default=0
         Cap on merges per survivor (0 = unlimited).
+    target_mask : Tensor, shape ``(B, H, L)``, dtype bool, optional
+        ``True`` at positions that may receive merges.  Survivors with ``False`` are
+        left untouched and never selected as nearest neighbour.  ``None`` means every
+        survivor is a valid target.
+    return_counts : bool, default=False
+        Also return ``counts`` of shape ``(B, H, L)`` (float32): the number of evicted
+        tokens folded into each position (0 for evicted, non-target and unmerged positions).
 
     Returns
     -------
-    tuple[Tensor, Tensor]
+    tuple[Tensor, Tensor] or tuple[Tensor, Tensor, Tensor]
         ``(new_keys, new_values)`` — same shape ``(B, H, L, D)`` as input.
         Survivor positions contain merged information; evicted positions are unchanged.
+        With ``return_counts=True`` the per-position merge counts are appended.
     """
     bsz, num_kv_heads, k_len, head_dim = keys.shape
     device = keys.device
@@ -628,12 +683,18 @@ def _merge_on_evict_adaptive(
     # Work on float32 copies for numerical stability
     merged_values = values.float().clone()
     merged_keys = keys.float().clone() if merge_keys else None
+    counts = torch.zeros(bsz, num_kv_heads, k_len, device=device, dtype=torch.float32)
+
+    keep_mask = ~evict_mask
+    if target_mask is not None:
+        assert target_mask.shape == evict_mask.shape, f"target_mask {tuple(target_mask.shape)} != {tuple(evict_mask.shape)}"
+        keep_mask = keep_mask & target_mask.to(evict_mask.device)
 
     # Iterate over (batch, head) — typically B=1, H=8 for Qwen3-8B = 8 iterations
     for b in range(bsz):
         for h in range(num_kv_heads):
             evict_idx = evict_mask[b, h].nonzero(as_tuple=True)[0]
-            keep_idx = (~evict_mask[b, h]).nonzero(as_tuple=True)[0]
+            keep_idx = keep_mask[b, h].nonzero(as_tuple=True)[0]
             n_evict = evict_idx.shape[0]
             n_kept = keep_idx.shape[0]
 
@@ -671,6 +732,11 @@ def _merge_on_evict_adaptive(
 
             # Merge weights
             w = max_sim.clamp(min=0) * merge_ok.float()
+
+            # Number of evicted tokens folded into each survivor (cap rescales weights, not counts)
+            cnt = torch.zeros(n_kept, device=device, dtype=torch.float32)
+            cnt.scatter_add_(0, target, merge_ok.float())
+            counts[b, h, keep_idx] = cnt
 
             if value_norm_weighting:
                 evict_v = values[b, h, evict_idx].float()
@@ -713,5 +779,7 @@ def _merge_on_evict_adaptive(
 
     result_values = merged_values.to(values.dtype)
     result_keys = merged_keys.to(keys.dtype) if merge_keys else keys
+    if return_counts:
+        return result_keys, result_values, counts
     return result_keys, result_values
 

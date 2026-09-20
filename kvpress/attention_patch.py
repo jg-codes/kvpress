@@ -48,6 +48,52 @@ def search_hyperplane(X, max_iter: int = 1000):
     raise ValueError("Could not find fake keys such that for every query q, exp(<q, k>) = 0")
 
 
+def apply_merge_logit_bias(module, query, key, attention_mask, bias):
+    """
+    Add a per-key additive logit bias (``module.merge_logit_bias``, shape ``(bsz, num_kv_heads, n_cached)``)
+    to the attention mask. Used by :class:`~kvpress.presses.merging_press.MergingPress` with
+    ``count_logit_bias=True``: a survivor that absorbed ``M`` evicted tokens carries ``log(1 + M)``
+    (KeepKV, arXiv:2504.09936), so its softmax odds are multiplied by ``1 + M``.
+
+    Cached positions beyond ``bias.shape[2]`` (new tokens) get bias 0. The bias is broadcast from
+    key-value heads to query heads (``repeat_interleave``, the ``repeat_kv`` order). If
+    ``attention_mask`` is ``None`` a causal float mask is built first, so the returned mask is always
+    a 4D additive float mask of shape ``(bsz, num_heads, q_len, k_len)`` in the query dtype.
+
+    Returns ``attention_mask`` unchanged when the bias is identically zero.
+    """
+    if bias is None or not bool(bias.any()):
+        return attention_mask
+    bsz, num_heads, q_len, _ = query.shape
+    num_kv_heads, k_len = key.shape[1], key.shape[2]
+    if bias.shape[2] > k_len:
+        raise ValueError(f"merge_logit_bias covers {bias.shape[2]} positions but the cache has {k_len}")
+    b = bias.to(device=query.device, dtype=query.dtype)
+    if b.shape[2] < k_len:
+        b = torch.nn.functional.pad(b, (0, k_len - b.shape[2]))
+    b = b.repeat_interleave(num_heads // num_kv_heads, dim=1).unsqueeze(2)  # (bsz, num_heads, 1, k_len)
+
+    min_val = torch.finfo(query.dtype).min
+    if attention_mask is None:
+        if q_len > 1:
+            kv_idx = torch.arange(k_len, device=query.device)
+            q_idx = torch.arange(q_len, device=query.device) + (k_len - q_len)
+            allowed = kv_idx[None, :] <= q_idx[:, None]
+            fmask = torch.zeros(q_len, k_len, dtype=query.dtype, device=query.device)
+            fmask = fmask.masked_fill(~allowed, min_val)[None, None]
+        else:
+            fmask = torch.zeros(1, 1, 1, k_len, dtype=query.dtype, device=query.device)
+    elif attention_mask.dtype == torch.bool:
+        fmask = torch.zeros(attention_mask.shape, dtype=query.dtype, device=query.device)
+        fmask = fmask.masked_fill(~attention_mask, min_val)
+    else:
+        fmask = attention_mask.to(query.dtype)
+    if fmask.ndim == 4:
+        fmask = fmask[:, :, :, :k_len]
+    module.merge_bias_calls = getattr(module, "merge_bias_calls", 0) + 1
+    return fmask + b
+
+
 def attention_patch(func):
     """
     Decorator to update the keys before the attention computation at the indices provided in module.masked_key_indices
@@ -70,7 +116,11 @@ def attention_patch(func):
         if query.shape[2] == key.shape[2]:
             # Prefilling
             module.masked_key_indices = None
-        elif getattr(module, "masked_key_indices", None) is not None:
+            module.merge_logit_bias = None
+        elif getattr(module, "merge_logit_bias", None) is not None:
+            # Decoding with merged survivors (MergingPress(count_logit_bias=True)): additive log(1+M) per key
+            attention_mask = apply_merge_logit_bias(module, query, key, attention_mask, module.merge_logit_bias)
+        if query.shape[2] != key.shape[2] and getattr(module, "masked_key_indices", None) is not None:
             # Decoding: build fake keys k s.t. exp(<q, k>) = 0
             bsz, num_heads, seq_len, head_dim = query.shape
             num_key_value_heads = key.shape[1]

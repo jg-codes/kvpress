@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 _EPS = 1e-6
 
 
+def _fraction_gate(max_sim: torch.Tensor, merge_ok: torch.Tensor, merge_fraction: float) -> torch.Tensor:
+    """Keep only the top ``merge_fraction`` of the *eligible* tokens by similarity, ranked within the
+    eligible set of each row (port of NVIDIA/kvpress#287, commit 58bc611; same idiom as
+    ``torch.nn.utils.prune.PruningContainer._combine_masks``). ``max_sim`` and ``merge_ok`` are
+    ``(..., n_evict)``; the rank is taken along the last dimension.
+    """
+    if merge_fraction >= 1.0 or not bool(merge_ok.any()):
+        return merge_ok
+    n_eligible = merge_ok.sum(dim=-1, keepdim=True)
+    n_merge = (n_eligible.float() * merge_fraction).round().clamp(min=1).long()
+    k_max = int(n_merge.max())
+    top_sim = max_sim.masked_fill(~merge_ok, float("-inf")).topk(k_max, dim=-1).values
+    threshold = top_sim.gather(-1, (n_merge - 1).clamp(max=k_max - 1))
+    return merge_ok & (max_sim >= threshold)
+
+
 def _merge_on_evict(
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -130,13 +146,8 @@ def _merge_on_evict(
     # --- Threshold gate ---
     merge_mask = max_sim >= similarity_threshold
 
-    # --- Fraction gate: keep only top merge_fraction of evicted tokens by similarity ---
-    if merge_fraction < 1.0 and merge_mask.any():
-        masked_sim = max_sim.clone()
-        masked_sim[~merge_mask] = float("inf")
-        q = 1.0 - merge_fraction
-        frac_threshold = masked_sim.quantile(q, dim=-1, keepdim=True)
-        merge_mask = merge_mask & (max_sim >= frac_threshold)
+    # --- Fraction gate (rank within the eligible set of each row, NVIDIA/kvpress#287) ---
+    merge_mask = _fraction_gate(max_sim, merge_mask, merge_fraction)
 
     # --- Perturbation-bound gate: skip merges with high estimated error ---
     # bound_i = ‖v_i‖ * (1 - w) / (1 + w)  where w = cosine similarity
@@ -713,13 +724,8 @@ def _merge_on_evict_adaptive(
             # Threshold gate
             merge_ok = max_sim >= similarity_threshold
 
-            # Fraction gate: keep only top merge_fraction of evicted tokens
-            if merge_fraction < 1.0 and merge_ok.any():
-                masked_sim = max_sim.clone()
-                masked_sim[~merge_ok] = float("inf")
-                q = 1.0 - merge_fraction
-                frac_threshold = masked_sim.quantile(q)
-                merge_ok = merge_ok & (max_sim >= frac_threshold)
+            # Fraction gate (rank within the eligible set, NVIDIA/kvpress#287)
+            merge_ok = _fraction_gate(max_sim, merge_ok, merge_fraction)
 
             # Perturbation-bound gate: skip merges with high estimated error
             if perturbation_gate > 0 and merge_ok.any():

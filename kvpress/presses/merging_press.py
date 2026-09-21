@@ -310,7 +310,11 @@ class MergingPress(BasePress):
       budget, returns truncated tensors with merged survivors.
     * ``MergingPress(AdaKVPress(ScorerPress))``: delegates to AdaKV's adaptive
       per-head budget allocation, then merges evicted tokens into survivors in-place.
-      Returns full-length tensors with ``masked_key_indices`` set.
+      Returns full-length tensors with ``masked_key_indices`` set.  With ``fold="mass"`` /
+      ``bias="score"`` the wrapper captures the ScorerPress score AdaKV consumed (computed once,
+      before AdaKV's in-place safeguard write) and folds each head's evicted tokens into that head's
+      survivors with weights ``exp(s_j - s_i)``; ``counts`` and ``bias`` are full-length in cache
+      order and zero at evicted (masked) positions, so the additive logit bias never reaches a fake key.
     * ``MergingPress(CriticalAdaKVPress(...))``: same pattern — any mask-based press.
     * ``MergingPress(DMSPress(ScorerPress))``: delegates to DMSPress's threshold-based
       eviction via its ``forward_hook``, then merges evicted tokens into survivors.
@@ -354,8 +358,9 @@ class MergingPress(BasePress):
         :class:`RestoreKVPress`) are never merge *targets*.  They are never evicted by
         the inner press, so they are never merge sources either.
     exclude_sink_targets : bool, default=False
-        Call-overriding inner presses only.  When ``True``, the first ``press.n_sink``
-        positions are never merge targets.
+        When ``True``, the first ``n_sink`` positions of the inner press (call-overriding presses), of the
+        ScorerPress inner, or of the ScorerPress wrapped by a mask-based allocator (``AdaKVPress(ScorerPress)``)
+        are never merge targets.
     count_logit_bias : bool, default=False
         Call-overriding inner presses only.  When ``True``, every survivor that absorbed
         ``M`` evicted tokens receives an additive attention-logit bias ``log(1 + M)``
@@ -368,7 +373,8 @@ class MergingPress(BasePress):
         ``"mass"`` folds with weights ``e^{s_j}`` in the inner press's own score mapped to
         log-mass units (``score_map``): ``v_i' = (e^{s_i} v_i + sum_j e^{s_j} v_j) / (e^{s_i} + sum_j e^{s_j})``.
         Cosine similarity is then used for routing only, and ``value_norm_weighting`` is ignored.
-        Available for :class:`ScorerPress` inner presses (``score()``) and for call-overriding
+        Available for :class:`ScorerPress` inner presses (``score()``), for mask-based allocators wrapping a
+        ScorerPress (``AdaKVPress(ScorerPress)``, whose consumed score is captured), and for call-overriding
         inner presses that expose a per-token ``score_val`` (KVzip family, incl. RestoreKVPress).
     bias : {"none", "score"}, default="none"
         ``"score"`` adds ``b_i = log(1 + sum_j exp(s_j - s_i))`` to the attention logit of every
@@ -412,9 +418,10 @@ class MergingPress(BasePress):
                 "call-overriding inner presses (KVzip family, RestoreKVPress) only"
             )
         if self.exclude_sink_targets:
-            assert self._is_call_overriding_press() or (
-                isinstance(self.press, ScorerPress) and hasattr(self.press, "n_sink")
-            ), "exclude_sink_targets needs a call-overriding inner press or a ScorerPress with an n_sink attribute"
+            assert self._is_call_overriding_press() or hasattr(self._scorer(), "n_sink"), (
+                "exclude_sink_targets needs a call-overriding inner press, a ScorerPress with an n_sink attribute, "
+                "or a mask-based wrapper (AdaKVPress) around such a ScorerPress"
+            )
         if self.bias == "score":
             assert self.fold == "mass", (
                 "bias='score' is the mass-restoring logit bias and must be combined with fold='mass'; "
@@ -422,11 +429,23 @@ class MergingPress(BasePress):
             )
             assert not self.count_logit_bias, "bias='score' and count_logit_bias are mutually exclusive"
         if self.fold == "mass":
-            if not (isinstance(self.press, ScorerPress) or self._exposes_score_val()):
+            if not (self._scorer() is not None or self._exposes_score_val()):
                 raise NotImplementedError(
-                    "fold='mass' needs a per-token score: a ScorerPress inner (score()) or a call-overriding "
-                    f"inner press exposing score_val (KVzip family); got {type(self.press).__name__}"
+                    "fold='mass' needs a per-token score: a ScorerPress inner (score()), a mask-based wrapper "
+                    "(AdaKVPress) around a ScorerPress, or a call-overriding inner press exposing score_val "
+                    f"(KVzip family); got {type(self.press).__name__}"
                 )
+
+    def _scorer(self) -> ScorerPress | None:
+        """The ScorerPress whose ``score()`` decides the eviction: the inner press itself, or the ScorerPress
+        wrapped by a mask-based budget allocator such as :class:`~kvpress.presses.adakv_press.AdaKVPress`
+        (``press.press``). ``None`` for hook-based and call-overriding inner presses."""
+        if isinstance(self.press, ScorerPress):
+            return self.press
+        if self._is_hook_based_press() or self._is_call_overriding_press():
+            return None
+        wrapped = getattr(self.press, "press", None)
+        return wrapped if isinstance(wrapped, ScorerPress) else None
 
     def _exposes_score_val(self) -> bool:
         """Call-overriding inner press (KVzip family, incl. RestoreKVPress) whose ``compress_post`` keeps the
@@ -625,7 +644,28 @@ class MergingPress(BasePress):
         # --- Mask-based press path (AdaKV, CriticalAdaKV, etc.) ---
         # Delegate to the inner press which sets module.masked_key_indices
         # and returns keys/values unchanged.
-        keys, values = self.press.compress(module, hidden_states, keys, values, attentions, kwargs)
+        module.merge_counts = None
+        module.merge_logit_bias = None
+        scorer = self._scorer()
+        need_scores = self.fold == "mass" and scorer is not None
+        captured: dict[str, torch.Tensor] = {}
+        if need_scores:
+            # Capture the per-token score the inner allocator consumes, BEFORE it mutates the tensor
+            # (AdaKVPress writes finfo.max into the safeguarded top-k in place). The fold and the bias then
+            # use exactly the score that decided the eviction, computed once.
+            original_score = scorer.score
+
+            def score_capturing(*args, **kw):
+                s = original_score(*args, **kw)
+                captured["scores"] = s.detach().clone()
+                return s
+
+            scorer.score = score_capturing  # instance attribute shadows the (possibly patched) class method
+        try:
+            keys, values = self.press.compress(module, hidden_states, keys, values, attentions, kwargs)
+        finally:
+            if need_scores:
+                del scorer.score
 
         mask_indices = getattr(module, "masked_key_indices", None)
         if mask_indices is None:
@@ -635,8 +675,27 @@ class MergingPress(BasePress):
         evict_mask = torch.zeros(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
         evict_mask[tuple(mask_indices)] = True
 
-        # Merge evicted tokens into their nearest cosine-similar survivors
-        new_keys, new_values = _merge_on_evict_adaptive(
+        # Survivors that may not receive merges: the first n_sink positions of the wrapped ScorerPress
+        target_mask = None
+        n_sink = int(getattr(scorer, "n_sink", 0) or 0)
+        if self.exclude_sink_targets and n_sink > 0:
+            target_mask = torch.ones(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
+            target_mask[:, :, :n_sink] = False
+
+        scores = None
+        if need_scores:
+            if "scores" not in captured:
+                raise RuntimeError(
+                    f"fold='mass': {type(self.press).__name__}.compress did not call {type(scorer).__name__}.score"
+                )
+            scores = _map_scores(captured["scores"], self.score_map)  # (B, H, L) in cache order
+            if scores.shape != evict_mask.shape:
+                raise RuntimeError(f"captured scores {tuple(scores.shape)} do not match the cache {tuple(evict_mask.shape)}")
+
+        # Merge evicted tokens into their nearest cosine-similar survivors (per head, variable budgets).
+        # Evicted positions stay in the cache and are masked at attention time; counts and bias are
+        # full-length in cache order and zero at evicted, non-target and unmerged positions.
+        new_keys, new_values, counts, bias = _merge_on_evict_adaptive(
             keys,
             values,
             evict_mask,
@@ -646,7 +705,14 @@ class MergingPress(BasePress):
             self.max_merge_per_token,
             self.merge_fraction,
             self.perturbation_gate,
+            target_mask=target_mask,
+            return_counts=True,
+            scores=scores,
+            fold=self.fold,
+            return_bias=True,
         )
+        module.merge_counts = counts
+        module.merge_logit_bias = bias if self.bias == "score" else None
         return new_keys, new_values
 
     def forward_hook(self, module: nn.Module, input: list[torch.Tensor], kwargs: dict, output: list):

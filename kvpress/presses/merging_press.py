@@ -20,6 +20,38 @@ logger = logging.getLogger(__name__)
 # Epsilon for numerical stability — safe for float16 (min ~6e-8) and bfloat16
 _EPS = 1e-6
 
+# Largest exponent used when converting a log-mass score difference into a fold weight.
+# Evicted tokens score at or below their survivor, so the difference is normally <= 0; the clamp
+# only guards rows where a mask-based inner press evicted a token that outscores its target.
+_MAX_LOG_WEIGHT = 30.0
+
+FOLDS = ("blend", "mass")
+BIASES = ("none", "score")
+SCORE_MAPS = ("log", "z")
+
+
+def _map_scores(scores: torch.Tensor, score_map: str) -> torch.Tensor:
+    """Map a press score ``(B, H, L)`` to log-mass units ``s`` (float32).
+
+    ``"log"``: ``s = log(score)`` for attention-type scores (SnapKV, TOVA, ExpectedAttention,
+    the KVzip / RestoreKV reconstruction attention), which are non-negative and proportional to
+    an attention mass. ``"z"``: per-(batch, head) z-score, for norm-type scores (KnormPress)
+    whose scale carries no mass interpretation.
+    """
+    s = scores.float()
+    if score_map == "log":
+        if bool((s < 0).any()):
+            raise ValueError(
+                "score_map='log' needs a non-negative (attention-type) score; this press returned negative "
+                "scores (norm-type, e.g. KnormPress) — use score_map='z'"
+            )
+        return torch.log(s.clamp(min=1e-30))
+    if score_map == "z":
+        mu = s.mean(dim=-1, keepdim=True)
+        sd = s.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        return (s - mu) / sd
+    raise ValueError(f"score_map must be one of {SCORE_MAPS}, got {score_map!r}")
+
 
 def _fraction_gate(max_sim: torch.Tensor, merge_ok: torch.Tensor, merge_fraction: float) -> torch.Tensor:
     """Keep only the top ``merge_fraction`` of the *eligible* tokens by similarity, ranked within the
@@ -48,13 +80,26 @@ def _merge_on_evict(
     max_merge_per_token: int = 0,
     merge_fraction: float = 1.0,
     perturbation_gate: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    fold: str = "blend",
+    score_map: str = "log",
+    target_mask: torch.Tensor | None = None,
+    return_stats: bool = False,
+):
     """
     Core merge-on-evict kernel for :class:`MergingPress`.
 
     Given per-token scores, partitions into *keep* and *evict* sets, then folds
     each evicted token into its most cosine-similar survivor via a weighted
     scatter-add instead of discarding it.
+
+    Two value folds are available. ``fold="blend"`` (shipped): weight
+    ``w_j = cos(k_j, k_i) * ||v_j|| / (||v_j|| + ||v_i||)``. ``fold="mass"``: weight
+    ``w_j = exp(s_j - s_i)`` with ``s`` the press score in log-mass units (see
+    :func:`_map_scores`), so that ``v_i' = (e^{s_i} v_i + sum_j e^{s_j} v_j) / (e^{s_i} + sum_j e^{s_j})``;
+    similarity is then used for routing only. With ``return_stats=True`` the kernel also returns
+    per-survivor merge counts and the score-based logit bias
+    ``b_i = log(1 + sum_j exp(s_j - s_i)) = log(1 + sum_j w_j)`` (zero for unmerged survivors),
+    which restores the folded attention mass at the survivor's softmax logit (C86).
 
     **Perturbation bound.**  For a single query position *t* and evicted token
     *i* routed to survivor *j* with cosine similarity :math:`w = \\cos(k_i, k_j)`:
@@ -88,10 +133,20 @@ def _merge_on_evict(
         merge weight is scaled down proportionally so the total deposited
         weight does not exceed ``max_merge_per_token × mean_weight``.
         ``0`` disables the cap (default).
+    fold : {"blend", "mass"}, default="blend"
+        Value fold (see above). ``"mass"`` ignores ``value_norm_weighting``.
+    score_map : {"log", "z"}, default="log"
+        Map from press score to log-mass units, used only when ``fold="mass"``.
+    target_mask : Tensor, shape ``(B, H, L)``, dtype bool, optional
+        ``True`` at positions that may receive merges (e.g. to exclude attention sinks).
+    return_stats : bool, default=False
+        Also return ``counts`` and ``bias`` of shape ``(B, H, n_kept)`` (float32) in survivor order.
+
     Returns
     -------
-    tuple[Tensor, Tensor]
-        ``(merged_keys, merged_values)`` each of shape ``(B, H, n_kept, D)``.
+    tuple[Tensor, Tensor] or tuple[Tensor, Tensor, Tensor, Tensor]
+        ``(merged_keys, merged_values)`` each of shape ``(B, H, n_kept, D)``;
+        with ``return_stats=True`` also ``(counts, bias)``.
 
     Notes
     -----
@@ -141,6 +196,10 @@ def _merge_on_evict(
     e_norm = evict_keys_f / e_norms
     s_norm = kept_keys_f / s_norms
     sim = torch.matmul(e_norm, s_norm.transpose(-2, -1))  # (B, H, n_evict, n_kept)
+    if target_mask is not None:
+        # Survivors that may not receive merges (sinks, restore slots) are removed from the routing
+        kept_target_ok = target_mask.to(keys.device).gather(2, keep_idx)  # (B, H, n_kept)
+        sim = sim.masked_fill(~kept_target_ok.unsqueeze(2), float("-inf"))
     max_sim, target_idx = sim.max(dim=-1)  # (B, H, n_evict)
 
     # --- Threshold gate ---
@@ -157,6 +216,9 @@ def _merge_on_evict(
         merge_mask = merge_mask & (error_bound <= perturbation_gate)
 
     if not merge_mask.any():
+        if return_stats:
+            zeros = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
+            return kept_keys.contiguous(), kept_values.contiguous(), zeros, zeros.clone()
         return kept_keys.contiguous(), kept_values.contiguous()
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -174,19 +236,28 @@ def _merge_on_evict(
             max_count,
         )
 
-    # --- Similarity-weighted scatter-add merge ---
-    evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
+    # --- Merge weights ---
+    if fold == "mass":
+        # w_j = exp(s_j - s_i): the evicted token's attention mass relative to its survivor's
+        s = _map_scores(scores, score_map)  # (B, H, L)
+        s_evict = s.gather(2, evict_idx)
+        s_target = s.gather(2, keep_idx).gather(2, target_idx)
+        evict_w = torch.exp((s_evict - s_target).clamp(max=_MAX_LOG_WEIGHT)) * merge_mask
+    else:
+        # Similarity-weighted (x relative value norm) blend
+        evict_w = max_sim.clamp(min=0) * merge_mask  # (B, H, n_evict)
+        if value_norm_weighting:
+            ev_vnorm = evict_values.float().norm(dim=-1)
+            target_vnorm = kept_values.float().norm(dim=-1).gather(2, target_idx)
+            rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + _EPS)
+            evict_w = evict_w * rel_norm
 
-    if value_norm_weighting:
-        ev_vnorm = evict_values.float().norm(dim=-1)
-        target_vnorm = kept_values.float().norm(dim=-1).gather(2, target_idx)
-        rel_norm = ev_vnorm / (ev_vnorm + target_vnorm + _EPS)
-        evict_w = evict_w * rel_norm
+    # Number of evicted tokens folded into each survivor (the cap rescales weights, not counts)
+    merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
+    merge_count.scatter_add_(2, target_idx, merge_mask.float())
 
     # --- Merge count cap: prevent survivor dilution ---
     if max_merge_per_token > 0:
-        merge_count = torch.zeros(bsz, num_key_value_heads, n_kept, device=keys.device, dtype=torch.float32)
-        merge_count.scatter_add_(2, target_idx, merge_mask.float())
         excess = (merge_count / max_merge_per_token).clamp(min=1.0)
         evict_w = evict_w / excess.gather(2, target_idx)
 
@@ -216,6 +287,10 @@ def _merge_on_evict(
     else:
         merged_keys = kept_keys
 
+    if return_stats:
+        # b_i = log(1 + sum_j w_j); equals log(1 + sum_j exp(s_j - s_i)) for fold="mass"
+        bias = torch.log1p(w_accum)
+        return merged_keys.contiguous(), merged_values.contiguous(), merge_count, bias
     return merged_keys.contiguous(), merged_values.contiguous()
 
 
@@ -288,6 +363,24 @@ class MergingPress(BasePress):
         mask by :func:`kvpress.attention_patch.attention_patch`.  Unmerged positions
         get bias 0.  Requires an attention implementation that accepts an additive
         float mask (eager, sdpa); not compatible with flash attention.
+    fold : {"blend", "mass"}, default="blend"
+        Value fold.  ``"blend"`` is the shipped similarity x relative-value-norm blend.
+        ``"mass"`` folds with weights ``e^{s_j}`` in the inner press's own score mapped to
+        log-mass units (``score_map``): ``v_i' = (e^{s_i} v_i + sum_j e^{s_j} v_j) / (e^{s_i} + sum_j e^{s_j})``.
+        Cosine similarity is then used for routing only, and ``value_norm_weighting`` is ignored.
+        Available for :class:`ScorerPress` inner presses (``score()``) and for call-overriding
+        inner presses that expose a per-token ``score_val`` (KVzip family, incl. RestoreKVPress).
+    bias : {"none", "score"}, default="none"
+        ``"score"`` adds ``b_i = log(1 + sum_j exp(s_j - s_i))`` to the attention logit of every
+        survivor ``i`` that absorbed evicted tokens ``j`` (zero for unmerged survivors, never on
+        restore slots or sinks when those are excluded as targets), through the same attention-mask
+        hook as ``count_logit_bias``.  With ``fold="mass"`` this restores, at the survivor's logit,
+        the attention mass the folded tokens carried under the press score.  Requires
+        ``fold="mass"``: a logit bias on top of the similarity/value-norm blend is not allowed.
+    score_map : {"log", "z"}, default="log"
+        Map from press score to log-mass units for ``fold="mass"`` / ``bias="score"``: ``"log"``
+        for attention-type scores (SnapKV, TOVA, ExpectedAttention, KVzip/RestoreKV reconstruction
+        attention), ``"z"`` for norm-type scores (KnormPress).
     """
 
     press: BasePress
@@ -300,6 +393,9 @@ class MergingPress(BasePress):
     exclude_restore_targets: bool = False
     exclude_sink_targets: bool = False
     count_logit_bias: bool = False
+    fold: str = "blend"
+    bias: str = "none"
+    score_map: str = "log"
 
     def __post_init__(self):
         assert isinstance(self.press, BasePress), f"MergingPress requires a BasePress, got {type(self.press)}"
@@ -307,11 +403,35 @@ class MergingPress(BasePress):
         assert self.max_merge_per_token >= 0, "max_merge_per_token must be non-negative"
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
         assert self.perturbation_gate >= 0.0, "perturbation_gate must be non-negative"
-        if self.exclude_restore_targets or self.exclude_sink_targets or self.count_logit_bias:
+        assert self.fold in FOLDS, f"fold must be one of {FOLDS}, got {self.fold!r}"
+        assert self.bias in BIASES, f"bias must be one of {BIASES}, got {self.bias!r}"
+        assert self.score_map in SCORE_MAPS, f"score_map must be one of {SCORE_MAPS}, got {self.score_map!r}"
+        if self.exclude_restore_targets or self.count_logit_bias:
             assert self._is_call_overriding_press(), (
-                "exclude_restore_targets / exclude_sink_targets / count_logit_bias are implemented for "
+                "exclude_restore_targets / count_logit_bias are implemented for "
                 "call-overriding inner presses (KVzip family, RestoreKVPress) only"
             )
+        if self.exclude_sink_targets:
+            assert self._is_call_overriding_press() or (
+                isinstance(self.press, ScorerPress) and hasattr(self.press, "n_sink")
+            ), "exclude_sink_targets needs a call-overriding inner press or a ScorerPress with an n_sink attribute"
+        if self.bias == "score":
+            assert self.fold == "mass", (
+                "bias='score' is the mass-restoring logit bias and must be combined with fold='mass'; "
+                "it is not defined on top of the similarity / value-norm blend (fold='blend')"
+            )
+            assert not self.count_logit_bias, "bias='score' and count_logit_bias are mutually exclusive"
+        if self.fold == "mass":
+            if not (isinstance(self.press, ScorerPress) or self._exposes_score_val()):
+                raise NotImplementedError(
+                    "fold='mass' needs a per-token score: a ScorerPress inner (score()) or a call-overriding "
+                    f"inner press exposing score_val (KVzip family); got {type(self.press).__name__}"
+                )
+
+    def _exposes_score_val(self) -> bool:
+        """Call-overriding inner press (KVzip family, incl. RestoreKVPress) whose ``compress_post`` keeps the
+        per-token reconstruction score in ``score_val`` of shape ``(n_layers, bsz, num_kv_heads, context_length)``."""
+        return self._is_call_overriding_press() and hasattr(self.press, "score_val")
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -406,7 +526,16 @@ class MergingPress(BasePress):
                     target_mask[:, :, int(context_length):] = False
                 if self.exclude_sink_targets and n_sink > 0:
                     target_mask[:, :, :n_sink] = False
-            new_keys, new_values, counts = _merge_on_evict_adaptive(
+            scores = None
+            if self.fold == "mass":
+                # Per-token reconstruction score of the KVzip family, (bsz, num_kv_heads, context_length);
+                # appended slots (restore tokens) have no score: they are never evicted, and get +inf so that
+                # a fold into one of them (only possible without exclude_restore_targets) carries weight 0.
+                score_val = self.press.score_val[int(module.layer_idx)]
+                s_ctx = _map_scores(score_val.to(keys.device), self.score_map)
+                scores = torch.full((bsz, num_kv_heads, k_len), float("inf"), device=keys.device, dtype=torch.float32)
+                scores[:, :, : s_ctx.shape[2]] = s_ctx
+            new_keys, new_values, counts, bias = _merge_on_evict_adaptive(
                 keys,
                 values,
                 evict_mask,
@@ -418,11 +547,16 @@ class MergingPress(BasePress):
                 self.perturbation_gate,
                 target_mask=target_mask,
                 return_counts=True,
+                scores=scores,
+                fold=self.fold,
+                return_bias=True,
             )
             self._write_back(cache, module.layer_idx, new_keys, new_values)
             module.merge_counts = counts
             if self.count_logit_bias:
                 module.merge_logit_bias = torch.log1p(counts)
+            elif self.bias == "score":
+                module.merge_logit_bias = bias
 
     @staticmethod
     def _write_back(cache, layer_idx, new_keys, new_values):
@@ -460,7 +594,13 @@ class MergingPress(BasePress):
             if n_kept <= 0:
                 return keys[:, :, :0, :].contiguous(), values[:, :, :0, :].contiguous()
 
-            return _merge_on_evict(
+            target_mask = None
+            n_sink = int(getattr(self.press, "n_sink", 0) or 0)
+            if self.exclude_sink_targets and n_sink > 0:
+                target_mask = torch.ones(bsz, num_key_value_heads, k_len, device=keys.device, dtype=torch.bool)
+                target_mask[:, :, :n_sink] = False
+
+            keys, values, counts, bias = _merge_on_evict(
                 keys,
                 values,
                 scores,
@@ -471,7 +611,16 @@ class MergingPress(BasePress):
                 self.max_merge_per_token,
                 self.merge_fraction,
                 self.perturbation_gate,
+                fold=self.fold,
+                score_map=self.score_map,
+                target_mask=target_mask,
+                return_stats=True,
             )
+            # Survivor-ordered stats, (B, H, n_kept): the truncated cache keeps survivors in this order, so the
+            # bias aligns with the cache positions the attention patch sees at decode (new tokens get bias 0).
+            module.merge_counts = counts
+            module.merge_logit_bias = bias if self.bias == "score" else None
+            return keys, values
 
         # --- Mask-based press path (AdaKV, CriticalAdaKV, etc.) ---
         # Delegate to the inner press which sets module.masked_key_indices
@@ -646,6 +795,9 @@ def _merge_on_evict_adaptive(
     perturbation_gate: float = 0.0,
     target_mask: torch.Tensor | None = None,
     return_counts: bool = False,
+    scores: torch.Tensor | None = None,
+    fold: str = "blend",
+    return_bias: bool = False,
 ):
     """
     Merge-on-evict with variable per-head eviction counts for :class:`MergingPress`.
@@ -680,21 +832,34 @@ def _merge_on_evict_adaptive(
     return_counts : bool, default=False
         Also return ``counts`` of shape ``(B, H, L)`` (float32): the number of evicted
         tokens folded into each position (0 for evicted, non-target and unmerged positions).
+    scores : Tensor, shape ``(B, H, L)``, optional
+        Per-token press score in log-mass units (the caller applies :func:`_map_scores`, because
+        appended slots without a score must be padded after the map). Required for ``fold="mass"``.
+    fold : {"blend", "mass"}, default="blend"
+        See :func:`_merge_on_evict`.
+    return_bias : bool, default=False
+        Also return ``bias`` of shape ``(B, H, L)`` (float32): ``log(1 + sum_j w_j)`` at survivors that
+        received merges, 0 elsewhere.
 
     Returns
     -------
-    tuple[Tensor, Tensor] or tuple[Tensor, Tensor, Tensor]
-        ``(new_keys, new_values)`` — same shape ``(B, H, L, D)`` as input.
+    tuple
+        ``(new_keys, new_values)`` — same shape ``(B, H, L, D)`` as input, followed by ``counts``
+        if ``return_counts`` and ``bias`` if ``return_bias``.
         Survivor positions contain merged information; evicted positions are unchanged.
-        With ``return_counts=True`` the per-position merge counts are appended.
     """
     bsz, num_kv_heads, k_len, head_dim = keys.shape
     device = keys.device
+    if fold == "mass":
+        assert scores is not None, "fold='mass' needs per-token scores"
+        assert scores.shape == evict_mask.shape, f"scores {tuple(scores.shape)} != evict_mask {tuple(evict_mask.shape)}"
+        s_all = scores.to(device=device, dtype=torch.float32)
 
     # Work on float32 copies for numerical stability
     merged_values = values.float().clone()
     merged_keys = keys.float().clone() if merge_keys else None
     counts = torch.zeros(bsz, num_kv_heads, k_len, device=device, dtype=torch.float32)
+    bias_out = torch.zeros(bsz, num_kv_heads, k_len, device=device, dtype=torch.float32)
 
     keep_mask = ~evict_mask
     if target_mask is not None:
@@ -737,14 +902,18 @@ def _merge_on_evict_adaptive(
                 continue
 
             # Merge weights
-            w = max_sim.clamp(min=0) * merge_ok.float()
+            if fold == "mass":
+                s_row = s_all[b, h]
+                w = torch.exp((s_row[evict_idx] - s_row[keep_idx[target]]).clamp(max=_MAX_LOG_WEIGHT)) * merge_ok.float()
+            else:
+                w = max_sim.clamp(min=0) * merge_ok.float()
 
             # Number of evicted tokens folded into each survivor (cap rescales weights, not counts)
             cnt = torch.zeros(n_kept, device=device, dtype=torch.float32)
             cnt.scatter_add_(0, target, merge_ok.float())
             counts[b, h, keep_idx] = cnt
 
-            if value_norm_weighting:
+            if fold != "mass" and value_norm_weighting:
                 evict_v = values[b, h, evict_idx].float()
                 target_v = values[b, h, keep_idx[target]].float()
                 ev_norm = evict_v.norm(dim=-1)
@@ -774,6 +943,7 @@ def _merge_on_evict_adaptive(
             orig_v = merged_values[b, h, keep_idx]
             new_v = (orig_v + val_accum) / total_w
             merged_values[b, h, keep_idx] = torch.where(active.unsqueeze(-1), new_v, orig_v)
+            bias_out[b, h, keep_idx] = torch.log1p(w_accum)  # 0 where w_accum == 0
 
             if merge_keys and merged_keys is not None:
                 evict_k_orig = keys[b, h, evict_idx].float()
@@ -785,7 +955,10 @@ def _merge_on_evict_adaptive(
 
     result_values = merged_values.to(values.dtype)
     result_keys = merged_keys.to(keys.dtype) if merge_keys else keys
+    out = [result_keys, result_values]
     if return_counts:
-        return result_keys, result_values, counts
-    return result_keys, result_values
+        out.append(counts)
+    if return_bias:
+        out.append(bias_out)
+    return tuple(out)
 

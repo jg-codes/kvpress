@@ -51,9 +51,13 @@ def search_hyperplane(X, max_iter: int = 1000):
 def apply_merge_logit_bias(module, query, key, attention_mask, bias):
     """
     Add a per-key additive logit bias (``module.merge_logit_bias``, shape ``(bsz, num_kv_heads, n_cached)``)
-    to the attention mask. Used by :class:`~kvpress.presses.merging_press.MergingPress` with
-    ``count_logit_bias=True``: a survivor that absorbed ``M`` evicted tokens carries ``log(1 + M)``
-    (KeepKV, arXiv:2504.09936), so its softmax odds are multiplied by ``1 + M``.
+    to the attention mask. Used by :class:`~kvpress.presses.merging_press.MergingPress`: with
+    ``count_logit_bias=True`` a survivor that absorbed ``M`` evicted tokens carries ``log(1 + M)``
+    (KeepKV, arXiv:2504.09936), so its softmax odds are multiplied by ``1 + M``; with ``bias="score"``
+    it carries ``log(1 + sum_j exp(s_j - s_i))``, the attention mass its folded tokens held under the
+    press score, so the compressed softmax assigns the survivor the mass of itself and its fold.
+    The bias tensor is indexed in cache order: full length for mask-based inner presses, survivor
+    order (``n_kept``) for the truncated ScorerPress path.
 
     Cached positions beyond ``bias.shape[2]`` (new tokens) get bias 0. The bias is broadcast from
     key-value heads to query heads (``repeat_interleave``, the ``repeat_kv`` order). If
@@ -118,7 +122,7 @@ def attention_patch(func):
             module.masked_key_indices = None
             module.merge_logit_bias = None
         elif getattr(module, "merge_logit_bias", None) is not None:
-            # Decoding with merged survivors (MergingPress(count_logit_bias=True)): additive log(1+M) per key
+            # Decoding with merged survivors (MergingPress count_logit_bias / bias="score"): additive per-key logit bias
             attention_mask = apply_merge_logit_bias(module, query, key, attention_mask, module.merge_logit_bias)
         if query.shape[2] != key.shape[2] and getattr(module, "masked_key_indices", None) is not None:
             # Decoding: build fake keys k s.t. exp(<q, k>) = 0

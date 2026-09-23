@@ -90,6 +90,8 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
                     # KVzipPress, FastKVzipPress and KVComposePress are currently not compatible with ComposedPress
                     return
                 press = ComposedPress(presses=[press])
+            elif wrapper_press is MergingPress and isinstance(press, KVzipPress):
+                press = MergingPress(press=press)
             elif not isinstance(press, ScorerPress):  # remaining wrapper presses only support ScorerPress
                 return
             elif issubclass(

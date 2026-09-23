@@ -5,9 +5,10 @@ import pytest
 import torch
 from transformers import DynamicCache
 
-from kvpress import KnormPress
+from kvpress import AdaKVPress, KnormPress, KVgradPress, KVzipPress
 from kvpress.presses.merging_press import MergingPress
-from tests.fixtures import unit_test_model  # noqa: F401
+from tests.default_presses import TestRestoreKVPress
+from tests.fixtures import kv_press_unit_test_pipeline, unit_test_model  # noqa: F401
 
 
 def test_merge_differs_from_hard_eviction(unit_test_model):  # noqa: F811
@@ -188,3 +189,97 @@ def test_merge_fraction_one_is_unchanged_by_the_gate():
     """merge_fraction=1.0 merges every eligible token."""
     shares = _merged_share(1.0, [0.0, 0.5])
     assert shares == [1.0, 1.0]
+
+
+def _prefill(press, model, input_ids):
+    cache = DynamicCache()
+    with press(model):
+        model(input_ids, past_key_values=cache)
+    masks = [layer.self_attn.masked_key_indices for layer in model.model.layers]
+    return cache, masks
+
+
+def _evicted_counts(mask, shape):
+    evicted = torch.zeros(shape, dtype=torch.bool)
+    evicted[mask] = True
+    return evicted.sum(-1)
+
+
+KVZIP_FAMILY = [
+    lambda: KVzipPress(compression_ratio=0.5),
+    lambda: KVgradPress(compression_ratio=0.5, chunk_size=64),
+    lambda: TestRestoreKVPress(compression_ratio=0.5),
+]
+
+
+@pytest.mark.parametrize("make_press", KVZIP_FAMILY, ids=["KVzipPress", "KVgradPress", "RestoreKVPress"])
+def test_kvzip_family_inner(unit_test_model, make_press):  # noqa: F811
+    """A KVzipPress inner decides the eviction; MergingPress only rewrites survivor values."""
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+    cache_bare, masks_bare = _prefill(make_press(), unit_test_model, input_ids)
+    cache_merge, masks_merge = _prefill(MergingPress(press=make_press()), unit_test_model, input_ids)
+
+    assert cache_bare.get_seq_length() == cache_merge.get_seq_length()
+    any_diff = False
+    for layer_bare, layer_merge, mask_bare, mask_merge in zip(
+        cache_bare.layers, cache_merge.layers, masks_bare, masks_merge
+    ):
+        shape = layer_bare.keys.shape[:3]
+        # Same evicted pairs, hence the same kept count per (layer, kv-head)
+        assert torch.equal(_evicted_counts(mask_bare, shape), _evicted_counts(mask_merge, shape))
+        assert all(torch.equal(a, b) for a, b in zip(mask_bare, mask_merge))
+        assert torch.equal(layer_bare.keys, layer_merge.keys)
+        # Evicted pairs are masked at attention time and left unchanged
+        assert torch.equal(layer_bare.values[mask_bare], layer_merge.values[mask_merge])
+        any_diff |= not torch.equal(layer_bare.values, layer_merge.values)
+    assert any_diff, "MergingPress did not change any survivor value"
+
+
+def test_merge_mask_matches_merge():
+    """With the same number of evicted tokens per head, merge_mask equals merge on the kept positions."""
+    torch.manual_seed(0)
+    keys, values = torch.randn(2, 3, 16, 8), torch.randn(2, 3, 16, 8)
+    kept = torch.rand(2, 3, 16).topk(6, dim=-1).indices.sort(dim=-1).values
+    evicted = torch.ones(2, 3, 16, dtype=torch.bool).scatter_(2, kept, False)
+
+    press = MergingPress(press=KnormPress(compression_ratio=0.5))
+    _, expected = press.merge(keys, values, kept)
+    torch.testing.assert_close(press.merge_mask(keys, values, evicted), expected)
+
+
+def test_restorekv_inner_pipeline_without_merges(kv_press_unit_test_pipeline, monkeypatch):  # noqa: F811
+    """With no merge (similarity_threshold=1.0) the wrapper reproduces the inner press end to end.
+
+    The question must start after the restore slots, as for the bare RestoreKVPress.
+    """
+    pipe = kv_press_unit_test_pipeline
+    context, question = "This is a test article. It was written on 2022-01-01.", "When was the article written?"
+    context_lengths, answers = [], []
+    generate_answer = pipe.generate_answer
+
+    def spy(question_ids, cache, context_length, max_new_tokens):
+        context_lengths.append(context_length)
+        return generate_answer(question_ids, cache, context_length, max_new_tokens)
+
+    monkeypatch.setattr(pipe, "generate_answer", spy)
+    for wrap in [False, True]:
+        press = TestRestoreKVPress(compression_ratio=0.5)
+        press = MergingPress(press=press, similarity_threshold=1.0) if wrap else press
+        answers.append(pipe(context, question=question, press=press)["answer"])
+    assert context_lengths[0] == context_lengths[1]
+    assert answers[0] == answers[1]
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        lambda: MergingPress(press=KnormPress(compression_ratio=0.5)),
+        lambda: MergingPress(press=KVzipPress(compression_ratio=0.5)),
+        lambda: AdaKVPress(press=KnormPress(compression_ratio=0.5)),
+    ],
+    ids=["MergingPress(KnormPress)", "MergingPress(KVzipPress)", "AdaKVPress(KnormPress)"],
+)
+def test_unsupported_inner_raises(inner):
+    with pytest.raises(AssertionError, match="requires a ScorerPress or a KVzipPress"):
+        MergingPress(press=inner())

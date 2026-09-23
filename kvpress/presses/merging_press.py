@@ -2,14 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Generator
 
 import torch
 from torch import nn
+from transformers import PreTrainedModel, QuantizedCache
 
 from kvpress.presses.base_press import BasePress
+from kvpress.presses.kvzip_press import KVzipPress
 from kvpress.presses.scorer_press import ScorerPress
-from kvpress.utils import compute_n_kept
+from kvpress.utils import compute_n_kept, extract_keys_and_values
 
 # Epsilon for numerical stability — safe for float16 (min ~6e-8) and bfloat16
 _EPS = 1e-6
@@ -18,11 +22,16 @@ _EPS = 1e-6
 @dataclass
 class MergingPress(BasePress):
     """
-    Merge-on-evict wrapper for any :class:`ScorerPress`.
+    Merge-on-evict wrapper for any :class:`ScorerPress` or :class:`KVzipPress`.
 
     Replaces hard eviction with weighted value blending: each evicted token's
     value is folded into its most cosine-similar surviving neighbor, scaled by
     the relative value-norm of evictor and target. Keys are preserved (RoPE-safe).
+
+    A :class:`KVzipPress` (including :class:`KVgradPress` and :class:`RestoreKVPress`) scores the
+    context in its own forward passes and evicts by masking (``module.masked_key_indices``), with a
+    different number of evicted tokens per head. For these presses the merge runs once, after the
+    inner press has set the masks, on the evicted pairs that stay in the cache (:meth:`merge_mask`).
 
     Inspired by Token Merging (Bolya et al., ICLR 2023, https://arxiv.org/abs/2210.09461)
     and D2O (Wan et al., 2024, https://arxiv.org/abs/2406.13035).
@@ -31,8 +40,8 @@ class MergingPress(BasePress):
 
     Parameters
     ----------
-    press : ScorerPress
-        Underlying scorer that decides which tokens survive.
+    press : ScorerPress or KVzipPress
+        Underlying press that decides which tokens survive.
     similarity_threshold : float, default=0.0
         Minimum cosine similarity for a merge to proceed.
     merge_fraction : float, default=1.0
@@ -40,13 +49,13 @@ class MergingPress(BasePress):
         Task-dependent: 1.0 wins on retrieval, 0.75 wins on extraction.
     """
 
-    press: ScorerPress = None  # type: ignore[assignment]
+    press: ScorerPress | KVzipPress = None  # type: ignore[assignment]
     similarity_threshold: float = 0.0
     merge_fraction: float = 1.0
 
     def __post_init__(self):
-        assert isinstance(self.press, ScorerPress), (
-            f"MergingPress requires a ScorerPress, got {type(self.press).__name__}"
+        assert isinstance(self.press, (ScorerPress, KVzipPress)), (
+            f"MergingPress requires a ScorerPress or a KVzipPress, got {type(self.press).__name__}"
         )
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
@@ -61,6 +70,27 @@ class MergingPress(BasePress):
     @compression_ratio.setter
     def compression_ratio(self, value: float) -> None:
         self.press.compression_ratio = value
+
+    @contextmanager
+    def __call__(self, model: PreTrainedModel) -> Generator:
+        if not isinstance(self.press, KVzipPress):
+            with super().__call__(model):
+                yield
+            return
+
+        with self.press(model):
+            yield
+            cache = self.press._cache  # set by KVzipPress during pre-filling, reset when its context exits
+        if self.press.compression_ratio == 0 or cache is None:
+            return
+        assert not isinstance(cache, QuantizedCache), "MergingPress with a KVzipPress does not support QuantizedCache"
+
+        for layer in model.model.layers:
+            module = layer.self_attn
+            keys, values = extract_keys_and_values(cache, module.layer_idx)
+            evicted = torch.zeros(keys.shape[:3], dtype=torch.bool, device=keys.device)
+            evicted[tuple(i.to(keys.device) for i in module.masked_key_indices)] = True
+            cache.layers[module.layer_idx].values = self.merge_mask(keys, values, evicted)
 
     def compress(
         self,
@@ -182,3 +212,33 @@ class MergingPress(BasePress):
         result_values = values.clone()
         result_values.scatter_(2, keep_idx, kept_values)
         return keys, result_values
+
+    def merge_mask(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        evicted: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Mask-based variant of :meth:`merge` for presses that evict a different number of tokens per
+        head. Each ``(batch, head)`` row is passed to :meth:`merge`. Evicted positions and keys are
+        not modified; the evicted pairs are masked at attention time.
+
+        Parameters
+        ----------
+        keys, values : Tensor, shape ``(B, H, L, D)``
+        evicted : Tensor, shape ``(B, H, L)``, dtype bool
+            ``True`` at evicted positions.
+
+        Returns
+        -------
+        Tensor, shape ``(B, H, L, D)``
+            Values with the evicted tokens folded into the survivors.
+        """
+        new_values = values.clone()
+        for b in range(keys.shape[0]):
+            for h in range(keys.shape[1]):
+                kept = (~evicted[b, h]).nonzero().view(1, 1, -1)
+                _, merged = self.merge(keys[b : b + 1, h : h + 1], values[b : b + 1, h : h + 1], kept)
+                new_values[b, h] = merged[0, 0]
+        return new_values

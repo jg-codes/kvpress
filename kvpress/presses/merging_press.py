@@ -47,11 +47,17 @@ class MergingPress(BasePress):
     merge_fraction : float, default=1.0
         Fraction of evicted tokens (ranked by similarity) that are merged.
         Task-dependent: 1.0 wins on retrieval, 0.75 wins on extraction.
+    targets : str, default="all"
+        Survivors that may receive merges. ``"all"``: every survivor. ``"context"``: survivors that
+        hold context tokens, i.e. not the first ``press.n_sink`` positions (attention sinks, when the
+        inner press defines ``n_sink``) and not the positions appended after the context (e.g. the
+        restore tokens of :class:`RestoreKVPress`).
     """
 
     press: ScorerPress | KVzipPress = None  # type: ignore[assignment]
     similarity_threshold: float = 0.0
     merge_fraction: float = 1.0
+    targets: str = "all"
 
     def __post_init__(self):
         assert isinstance(self.press, (ScorerPress, KVzipPress)), (
@@ -59,6 +65,7 @@ class MergingPress(BasePress):
         )
         assert 0.0 <= self.similarity_threshold <= 1.0
         assert 0.0 < self.merge_fraction <= 1.0, "merge_fraction must be in (0, 1]"
+        assert self.targets in ("all", "context"), f"targets must be 'all' or 'context', got {self.targets!r}"
 
     def post_init_from_model(self, model):
         self.press.post_init_from_model(model)
@@ -81,6 +88,7 @@ class MergingPress(BasePress):
         with self.press(model):
             yield
             cache = self.press._cache  # set by KVzipPress during pre-filling, reset when its context exits
+            context_length = cache.get_seq_length() if cache is not None else 0
         if self.press.compression_ratio == 0 or cache is None:
             return
         assert not isinstance(cache, QuantizedCache), "MergingPress with a KVzipPress does not support QuantizedCache"
@@ -90,7 +98,8 @@ class MergingPress(BasePress):
             keys, values = extract_keys_and_values(cache, module.layer_idx)
             evicted = torch.zeros(keys.shape[:3], dtype=torch.bool, device=keys.device)
             evicted[tuple(i.to(keys.device) for i in module.masked_key_indices)] = True
-            cache.layers[module.layer_idx].values = self.merge_mask(keys, values, evicted)
+            targets = self.merge_targets(evicted, context_length)
+            cache.layers[module.layer_idx].values = self.merge_mask(keys, values, evicted, targets)
 
     def compress(
         self,
@@ -118,7 +127,11 @@ class MergingPress(BasePress):
         indices = scores.topk(n_kept, dim=-1).indices
 
         # Merge evicted tokens into the survivors before pruning
-        keys, values = self.merge(keys, values, indices)
+        if self.targets == "all":
+            keys, values = self.merge(keys, values, indices)
+        else:
+            evicted = torch.ones(keys.shape[:3], dtype=torch.bool, device=keys.device).scatter_(2, indices, False)
+            values = self.merge_mask(keys, values, evicted, self.merge_targets(evicted, k_len))
 
         # Prune keys and values
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, module.head_dim)
@@ -218,6 +231,7 @@ class MergingPress(BasePress):
         keys: torch.Tensor,
         values: torch.Tensor,
         evicted: torch.Tensor,
+        targets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Mask-based variant of :meth:`merge` for presses that evict a different number of tokens per
@@ -229,16 +243,31 @@ class MergingPress(BasePress):
         keys, values : Tensor, shape ``(B, H, L, D)``
         evicted : Tensor, shape ``(B, H, L)``, dtype bool
             ``True`` at evicted positions.
+        targets : Tensor, shape ``(B, H, L)``, dtype bool, optional
+            ``True`` at the survivors that may receive merges. Default: every survivor.
 
         Returns
         -------
         Tensor, shape ``(B, H, L, D)``
             Values with the evicted tokens folded into the survivors.
         """
+        if targets is None:
+            targets = ~evicted
+        assert not (targets & evicted).any(), "an evicted position cannot be a merge target"
         new_values = values.clone()
         for b in range(keys.shape[0]):
             for h in range(keys.shape[1]):
-                kept = (~evicted[b, h]).nonzero().view(1, 1, -1)
-                _, merged = self.merge(keys[b : b + 1, h : h + 1], values[b : b + 1, h : h + 1], kept)
-                new_values[b, h] = merged[0, 0]
+                # Restrict the row to the evicted positions and the targets; other survivors are untouched
+                rows = (evicted[b, h] | targets[b, h]).nonzero().squeeze(-1)
+                kept = targets[b, h, rows].nonzero().view(1, 1, -1)
+                _, merged = self.merge(keys[b, h, rows][None, None], values[b, h, rows][None, None], kept)
+                new_values[b, h, rows] = merged[0, 0]
         return new_values
+
+    def merge_targets(self, evicted: torch.Tensor, context_length: int) -> torch.Tensor:
+        """Survivors that may receive merges, following ``targets`` (see the class docstring)."""
+        targets = ~evicted
+        if self.targets == "context":
+            targets[..., : getattr(self.press, "n_sink", 0)] = False
+            targets[..., context_length:] = False
+        return targets

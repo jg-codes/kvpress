@@ -5,7 +5,7 @@ import pytest
 import torch
 from transformers import DynamicCache
 
-from kvpress import AdaKVPress, KnormPress, KVgradPress, KVzipPress
+from kvpress import AdaKVPress, ExpectedAttentionPress, KnormPress, KVgradPress, KVzipPress, StreamingLLMPress
 from kvpress.presses.merging_press import MergingPress
 from tests.default_presses import TestRestoreKVPress
 from tests.fixtures import kv_press_unit_test_pipeline, unit_test_model  # noqa: F401
@@ -283,3 +283,77 @@ def test_restorekv_inner_pipeline_without_merges(kv_press_unit_test_pipeline, mo
 def test_unsupported_inner_raises(inner):
     with pytest.raises(AssertionError, match="requires a ScorerPress or a KVzipPress"):
         MergingPress(press=inner())
+
+
+def _sink_writes(full_layer, layer, n_sink):
+    """Number of (batch, head, sink) values that differ from the uncompressed cache.
+
+    Keys are never modified, so each sink is found in the compressed cache by its key.
+    """
+    sink_keys = full_layer.keys[:, :, :n_sink]
+    match = (layer.keys.unsqueeze(3) == sink_keys.unsqueeze(2)).all(-1)  # (B, H, n_kept, n_sink)
+    assert torch.equal(match.sum(2), torch.ones_like(match.sum(2))), "every sink must be kept exactly once"
+    slot = match.float().argmax(2).unsqueeze(-1).expand(-1, -1, -1, layer.values.shape[-1])
+    return int((layer.values.gather(2, slot) != full_layer.values[:, :, :n_sink]).any(-1).sum())
+
+
+@pytest.mark.parametrize("make_inner", [StreamingLLMPress, ExpectedAttentionPress])
+@pytest.mark.parametrize("targets", ["all", "context"])
+def test_targets_context_scorer_press_sinks(unit_test_model, make_inner, targets):  # noqa: F811
+    """targets='context' never writes into the attention sinks kept by the inner press."""
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, 1024, (2, 128), device=unit_test_model.device)
+    full = DynamicCache()
+    unit_test_model(input_ids, past_key_values=full)
+    inner = make_inner(compression_ratio=0.5)
+    cache = DynamicCache()
+    with MergingPress(press=inner, targets=targets)(unit_test_model):
+        unit_test_model(input_ids, past_key_values=cache)
+    writes = sum(_sink_writes(f, c, inner.n_sink) for f, c in zip(full.layers, cache.layers))
+    assert (writes == 0) if targets == "context" else (writes > 0)
+
+
+@pytest.mark.parametrize("cls", [KVzipPress, TestRestoreKVPress])
+def test_targets_context_kvzip_family(unit_test_model, cls):  # noqa: F811
+    """targets='context' never writes into sinks or restore slots and keeps the inner eviction."""
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
+    bare, inner = cls(compression_ratio=0.5), cls(compression_ratio=0.5)
+    if cls is TestRestoreKVPress:
+        bare.post_init_from_model(unit_test_model)
+        inner.post_init_from_model(unit_test_model)
+        # Distinct restore slots, so that a merge into them would be visible
+        bare.restore_embeddings = torch.randn_like(bare.restore_embeddings)
+        inner.restore_embeddings = bare.restore_embeddings.clone()
+    cache_bare, masks_bare = _prefill(bare, unit_test_model, input_ids)
+    cache_merge, masks_merge = _prefill(MergingPress(press=inner, targets="context"), unit_test_model, input_ids)
+
+    n_sink, context_length = bare.n_sink, input_ids.shape[1]
+    any_diff = False
+    for layer_bare, layer_merge, mask_bare, mask_merge in zip(
+        cache_bare.layers, cache_merge.layers, masks_bare, masks_merge
+    ):
+        assert all(torch.equal(a, b) for a, b in zip(mask_bare, mask_merge))
+        assert torch.equal(layer_bare.values[:, :, :n_sink], layer_merge.values[:, :, :n_sink])
+        assert torch.equal(layer_bare.values[:, :, context_length:], layer_merge.values[:, :, context_length:])
+        any_diff |= not torch.equal(layer_bare.values, layer_merge.values)
+    assert any_diff, "MergingPress did not change any survivor value"
+
+
+def test_merge_mask_leaves_non_targets_unchanged():
+    torch.manual_seed(0)
+    keys, values = torch.randn(1, 2, 16, 8), torch.randn(1, 2, 16, 8)
+    evicted = torch.zeros(1, 2, 16, dtype=torch.bool)
+    evicted[..., 8:] = True
+    targets = ~evicted
+    targets[..., :2] = False
+    press = MergingPress(press=KnormPress(compression_ratio=0.5))
+    new_values = press.merge_mask(keys, values, evicted, targets)
+    assert torch.equal(new_values[..., :2, :], values[..., :2, :])
+    assert torch.equal(new_values[..., 8:, :], values[..., 8:, :])
+    assert not torch.equal(new_values[..., 2:8, :], values[..., 2:8, :])
+
+
+def test_invalid_targets_raises():
+    with pytest.raises(AssertionError, match="targets must be"):
+        MergingPress(press=KnormPress(compression_ratio=0.5), targets="sinks")
